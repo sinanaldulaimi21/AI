@@ -4,6 +4,9 @@ Everything is drawn with code (Pillow) and the background music is
 synthesised with numpy, so the video can be regenerated or changed at any time.
 
 Usage:  python3 make_video.py            -> out/letter_baa.mp4 + out/thumbnail.png
+
+The narration (voice/letter_baa_voice.m4a) is mixed in; scene timings below
+follow the moments in that recording.
 """
 import math
 import os
@@ -20,7 +23,7 @@ FONT = os.path.join(HERE, "fonts", "Lalezar-Regular.ttf")
 W, H = 1280, 720          # output size
 S = 2                     # draw at 2x then downscale = smooth edges
 FPS = 30
-DUR = 30.0
+DUR = 47.0
 SR = 44100                # audio sample rate
 
 # Colours
@@ -279,11 +282,12 @@ def build_sprites():
     SP["subtitle"] = text_sprite("ويّا دودو", 60, color=INK, stroke=8)
     SP["baa"] = text_sprite("ب", 300, color=RED, stroke=16)
     SP["baa_nodot"] = text_sprite("ٮ", 300, color=RED, stroke=16, bbox_text="ب")
-    SP["forms"] = text_sprite("بـ      ـبـ      ـب", 95, color=INK, stroke=8)
+    for key, form in (("f_init", "بـ"), ("f_mid", "ـبـ"), ("f_end", "ـب")):
+        SP[key] = text_sprite(form, 110, color=INK, stroke=9)
     for key, word in (("w1", "بطة"), ("w2", "باب"), ("w3", "بيت")):
         SP[key] = text_sprite(word, 170, color=INK, stroke=14, hl_color=RED, hl_first="ب")
+        SP[key + "s"] = text_sprite(word, 95, color=INK, stroke=9, hl_color=RED, hl_first="ب")
     SP["bubble"] = text_sprite("ب", 70, color=WHITE, stroke=0)
-    SP["recap"] = text_sprite("ب بطة • ب باب • ب بيت", 80, color=INK, stroke=10)
     SP["sub"] = text_sprite("اشترك", 60, color=WHITE, stroke=0)
     SP["bye"] = text_sprite("نشوفكم بالحرف الجاي!", 64, color=RED, stroke=9)
 
@@ -295,28 +299,44 @@ def build_sprites():
     pad = p(8)
     box = (xs.min() - pad, ys.min() - pad, xs.max() + pad, ys.max() + pad)
     SP["dot"] = SP["baa"].crop(box)
-    # where the dot sits relative to the letter centre (in base pixels)
     SP["dot_off"] = ((box[0] + box[2]) / 2 / S - SP["baa"].width / 2 / S,
                      (box[1] + box[3]) / 2 / S - SP["baa"].height / 2 / S)
 
 
-# ---------------------------------------------------------------- scenes
-# timeline (seconds) — also used for sound effects
-T_TITLE, T_LETTER, T_DOT, T_FORMS = 0.4, 4.8, 6.2, 7.6
-T_W1, T_W2, T_W3, T_OUT = 10.0, 15.0, 20.0, 25.0
+# ---------------------------------------------------------------- timeline
+# Narration starts VOICE_SKIP seconds into the recording and is placed at
+# VOICE_AT in the video; every time below is video time.
+VOICE_SKIP, VOICE_AT = 7.6, 0.2
+T_TITLE = 0.4
+T_LETTER = 7.0     # "شوفوا هذا الحرف، شنو ناقصة؟"
+T_DOT = 11.4       # "نقطة واحدة جوا"
+T_THIS = 13.5      # "هذا حرف الباء"
+T_FORMS = (16.2, 17.6, 18.8)   # "بأول الكلمة / وبالنص / وبالأخير"
+T_W1 = 20.3        # "باء بطة ... كواك كواك"
+T_QUACKS = (23.5, 24.0, 24.8, 25.3)
+T_W2 = 26.1        # "باء باب، تك تك ... منو بالباب؟"
+T_KNOCKS = (28.15, 28.5, 29.2, 29.5)
+T_OPEN = 30.4
+T_W3 = 31.6        # "باء بيت، بيتنا الحلو"
+T_OUT = 36.0       # recap "باء بطة، باء باب، باء بيت"
+T_RECAP = (36.6, 38.2, 39.9)
+T_BYE = 41.7       # "نشوفكم بالحرف الجاي"
+T_SUB = 44.0       # "اشتركوا حبايبي"
 
 
-def word_scene(frame, d, t, start, key, draw_pic):
-    end = start + 5.0
+def near(t, times, width=0.18):
+    """1 at each event time, fading to 0 within `width` seconds."""
+    return max([clamp(1 - abs(t - e) / width) for e in times] + [0.0])
+
+
+def word_scene(frame, d, t, start, end, key, draw_pic):
     k = pop(t, start, end)
     if k <= 0:
         return
     # picture on the left, word on the right (Arabic reads right-to-left)
     draw_pic(k, t - start)
-    wk = pop(t, start + 0.35, end)
-    paste(frame, SP[key], 900, 330 + math.sin(t * 3) * 6, wk)
-    # bubble with the letter
-    bk = pop(t, start + 1.2, end)
+    paste(frame, SP[key], 900, 330 + math.sin(t * 3) * 6, pop(t, start + 0.3, end))
+    bk = pop(t, start + 0.9, end)
     if bk > 0:
         r = 52 * bk
         d.ellipse([p(900 - r), p(530 - r), p(900 + r), p(530 + r)], fill=RED)
@@ -327,80 +347,94 @@ def render(t, bg):
     frame = bg.copy()
     d = ImageDraw.Draw(frame)
     sun(d, t)
-    for i, (cx, cy, sp, sc) in enumerate([(200, 120, 18, 1.0), (650, 80, 11, 0.8),
-                                          (1000, 210, 14, 0.7)]):
-        x = (cx + t * sp) % (W + 300) - 150
-        cloud(d, x, cy, sc)
+    for cx, cy, sp, sc in [(200, 120, 18, 1.0), (650, 80, 11, 0.8), (1000, 210, 14, 0.7)]:
+        cloud(d, (cx + t * sp) % (W + 300) - 150, cy, sc)
 
-    # --- intro: duck walks in from the right, title drops
+    # --- intro: duck walks in from the right and waves, title drops
     if t < T_LETTER:
-        tx = ease_in_out(t / 2.6)
-        dx = 1450 - (1450 - 760) * tx
-        walking = t < 2.6
-        duck(d, dx, 545 + (abs(math.sin(t * 7)) * -10 if walking else 0), 1.15, t,
-             walking=walking, flap=(0.5 + 0.5 * math.sin(t * 12)) if t > 2.8 else 0)
-        k = pop(t, T_TITLE, T_LETTER)
+        walk_end = 3.0
+        dx = 1450 - (1450 - 760) * ease_in_out(t / walk_end)
+        walking = t < walk_end
+        hop = abs(math.sin(t * 7)) * -10 if walking else 0
+        duck(d, dx, 545 + hop, 1.15, t, walking=walking,
+             flap=(0.5 + 0.5 * math.sin(t * 12)) if t > walk_end else 0)
         drop = (1 - ease_out_elastic((t - T_TITLE) / 1.2)) * -300
-        paste(frame, SP["title"], 640, 210 + drop, 1.0 if t > T_TITLE else 0, k)
+        if t > T_TITLE:
+            paste(frame, SP["title"], 640, 210 + drop, pop(t, T_TITLE, T_LETTER, d_in=0.01))
         paste(frame, SP["subtitle"], 640, 320, pop(t, 1.6, T_LETTER))
 
     # --- big letter + falling dot + its three forms
     if T_LETTER <= t < T_W1:
         k = pop(t, T_LETTER, T_W1, d_in=0.8)
-        k = ease_out_elastic((t - T_LETTER) / 1.0) if t < T_LETTER + 1.0 else k
+        if t < T_LETTER + 1.0:
+            k = ease_out_elastic((t - T_LETTER) / 1.0)
+        k *= 1 + 0.12 * near(t, [T_THIS + 0.3], 0.4)   # pulse on "هذا حرف الباء"
         wob = math.sin(t * 2.5) * 3
-        cx, cy = 640, 300
+        cx, cy = 640, 290
         paste(frame, SP["baa_nodot"], cx, cy, k, angle=wob)
         if t >= T_DOT:
             fall = clamp((t - T_DOT) / 0.6)
-            bounce = abs(math.sin(clamp((t - T_DOT - 0.6) / 0.5) * math.pi)) * 30 * \
-                (1 - clamp((t - T_DOT - 0.6) / 0.5))
+            bt = clamp((t - T_DOT - 0.6) / 0.5)
+            bounce = abs(math.sin(bt * math.pi)) * 30 * (1 - bt)
             ox, oy = SP["dot_off"]
             y_end = cy + oy * k
             y = -60 + (y_end + 60) * (fall ** 2) - (bounce if fall >= 1 else 0)
             paste(frame, SP["dot"], cx + ox * k, y, k, angle=wob)
-        paste(frame, SP["forms"], 640, 590, pop(t, T_FORMS, T_W1))
-        # little duck peeking on the side cheering
-        duck(d, 1120, 560, 0.75, t, flap=0.5 + 0.5 * math.sin(t * 10))
+        else:
+            # question mark bubble while the dot is missing
+            qk = pop(t, T_LETTER + 1.2, T_DOT)
+            if qk > 0:
+                paste(frame, SP.setdefault("q", text_sprite("؟", 130, color=INK, stroke=10)),
+                      640 + math.sin(t * 6) * 8, 500, qk)
+        for (key, x), tf in zip((("f_init", 900), ("f_mid", 640), ("f_end", 380)), T_FORMS):
+            paste(frame, SP[key], x, 590, pop(t, tf, T_W1))
+        duck(d, 1150, 560, 0.75, t, flap=0.5 + 0.5 * math.sin(t * 10))
 
     # --- words
     def pic_duck(k, lt):
-        duck(d, 380, 420 - abs(math.sin(lt * 5)) * 18 * k, 1.5 * k, lt,
-             flap=0.5 + 0.5 * math.sin(lt * 10))
+        q = near(lt + T_W1, T_QUACKS, 0.22)
+        duck(d, 380, 420 - abs(math.sin(lt * 5)) * 14 * k - 40 * q, 1.5 * k * (1 + 0.08 * q), lt,
+             flap=max(q, 0.3 + 0.3 * math.sin(lt * 10)))
 
     def pic_door(k, lt):
-        open_amt = ease_in_out(clamp((lt - 1.0) / 1.0)) * (1 - ease_in_out(clamp((lt - 3.4) / 0.8)))
-        door(d, 380, 400, 1.2 * k, open_amt)
+        tt = lt + T_W2
+        shake = near(tt, T_KNOCKS, 0.12) * math.sin(tt * 90) * 6
+        open_amt = ease_in_out(clamp((tt - T_OPEN) / 0.8))
+        door(d, 380 + shake, 400, 1.2 * k, open_amt)
 
     def pic_house(k, lt):
         house(d, 380, 400, 1.25 * k, lt)
 
-    word_scene(frame, d, t, T_W1, "w1", pic_duck)
-    word_scene(frame, d, t, T_W2, "w2", pic_door)
-    word_scene(frame, d, t, T_W3, "w3", pic_house)
+    word_scene(frame, d, t, T_W1, T_W2, "w1", pic_duck)
+    word_scene(frame, d, t, T_W2, T_W3, "w2", pic_door)
+    word_scene(frame, d, t, T_W3, T_OUT, "w3", pic_house)
 
-    # --- outro: recap, subscribe button, stars
+    # --- outro: recap words one by one, goodbye, subscribe button, stars
     if t >= T_OUT:
         lt = t - T_OUT
-        paste(frame, SP["recap"], 640, 170, pop(t, T_OUT, DUR + 1))
-        paste(frame, SP["bye"], 640, 290, pop(t, T_OUT + 0.8, DUR + 1))
-        bk = pop(t, T_OUT + 1.4, DUR + 1) * (1 + 0.06 * math.sin(lt * 8))
+        for (key, x), tr in zip((("w1s", 900), ("w2s", 640), ("w3s", 380)), T_RECAP):
+            hi = 1 + 0.15 * near(t, [tr + 0.3], 0.5)
+            paste(frame, SP[key], x, 190, pop(t, tr, DUR + 1) * hi)
+        paste(frame, SP["bye"], 640, 300, pop(t, T_BYE, DUR + 1))
+        bk = pop(t, T_SUB, DUR + 1) * (1 + 0.06 * math.sin(lt * 8))
         if bk > 0:
             bw, bh = 260 * bk, 90 * bk
-            d.rounded_rectangle([p(640 - bw / 2), p(420 - bh / 2), p(640 + bw / 2), p(420 + bh / 2)],
+            d.rounded_rectangle([p(640 - bw / 2), p(430 - bh / 2), p(640 + bw / 2), p(430 + bh / 2)],
                                 radius=p(24 * bk), fill=(230, 33, 23))
-            paste(frame, SP["sub"], 640, 414, bk)
-        duck(d, 300, 540 - abs(math.sin(lt * 6)) * 25, 1.0, t, flap=0.5 + 0.5 * math.sin(t * 14))
-        rng = np.random.default_rng(int(1))
-        for i in range(18):
-            sx = rng.uniform(60, W - 60)
-            sy = (rng.uniform(-200, 0) + lt * rng.uniform(120, 220)) % (H + 40) - 20
-            col = [(255, 210, 30), (255, 110, 160), (110, 220, 255), (150, 240, 120)][i % 4]
-            star(d, sx, sy, 14 + 6 * math.sin(lt * 5 + i), col)
+            paste(frame, SP["sub"], 640, 424, bk)
+        duck(d, 300 if t < T_BYE else 1050, 545 - abs(math.sin(lt * 6)) * 25, 1.0, t,
+             flap=0.5 + 0.5 * math.sin(t * 14))
+        if t >= T_BYE:
+            rng = np.random.default_rng(1)
+            st = t - T_BYE
+            for i in range(18):
+                sx = rng.uniform(60, W - 60)
+                sy = (rng.uniform(-200, 0) + st * rng.uniform(120, 220)) % (H + 40) - 20
+                col = [(255, 210, 30), (255, 110, 160), (110, 220, 255), (150, 240, 120)][i % 4]
+                star(d, sx, sy, 14 + 6 * math.sin(st * 5 + i), col)
 
-    # fade from / to white at the very edges
     out = frame.resize((W, H), Image.LANCZOS).convert("RGB")
-    fade = min(clamp(t / 0.4), clamp((DUR - t) / 0.6))
+    fade = min(clamp(t / 0.4), clamp((DUR - t) / 0.8))
     if fade < 1:
         out = Image.blend(Image.new("RGB", (W, H), WHITE), out, fade)
     return out
@@ -449,48 +483,45 @@ def sfx_ding(vol=0.3):
     return tone(note_freq(84), 0.8, vol) + tone(note_freq(91), 0.8, vol * 0.5)
 
 
-def make_audio(path):
+def make_music(path):
+    """Background tune + sound effects (kept quiet so the voice stays clear)."""
     buf = np.zeros(int(SR * DUR))
-    bpm = 116
-    beat = 60 / bpm
-    # happy pentatonic tune in C (MIDI numbers, 0 = rest), 2 bars per line
+    beat = 60 / 116
     melody = [72, 74, 76, 79, 76, 74, 72, 0,
               74, 76, 79, 81, 79, 76, 74, 0,
               76, 79, 81, 84, 81, 79, 76, 74,
               72, 76, 74, 72, 67, 69, 72, 0]
     bass = [48, 48, 55, 55, 45, 45, 53, 55]
-    n = 0
-    tcur = 0.0
+    n, tcur = 0, 0.0
     while tcur < DUR - 1:
         m = melody[n % len(melody)]
         if m:
             add(buf, tone(note_freq(m), beat * 0.9, 0.11), tcur)
         if n % 2 == 0:
             add(buf, tone(note_freq(bass[(n // 4) % len(bass)]), beat * 1.6, 0.13, "square"), tcur)
-        if n % 2 == 1:  # soft shaker
+        else:
             noise = np.random.default_rng(n).normal(0, 1, int(SR * 0.05))
             add(buf, noise * np.exp(-np.arange(len(noise)) / SR * 80) * 0.03, tcur)
         tcur += beat / 2
         n += 1
+    buf *= 0.35  # music bed under the narration
 
-    for at in (T_TITLE + 0.3, 1.7, T_LETTER + 0.1, T_FORMS, T_W1 + 0.1, T_W1 + 0.4,
-               T_W2 + 0.1, T_W2 + 0.4, T_W3 + 0.1, T_W3 + 0.4, T_OUT + 0.1, T_OUT + 1.5):
-        add(buf, sfx_pop(), at)
-    add(buf, sfx_whistle_down(), T_DOT)
-    add(buf, sfx_boing(), T_DOT + 0.6)
-    for at in (T_W1 + 1.2, T_W2 + 1.2, T_W3 + 1.2):
-        add(buf, sfx_ding(), at)
+    for at in (T_TITLE + 0.3, T_LETTER + 0.1, *T_FORMS, T_W1 + 0.1, T_W2 + 0.1, T_W3 + 0.1,
+               *T_RECAP, T_BYE, T_SUB):
+        add(buf, sfx_pop(0.22), at)
+    add(buf, sfx_whistle_down(0.18), T_DOT)
+    add(buf, sfx_boing(0.3), T_DOT + 0.6)
+    for at in (T_W1 + 0.9, T_W2 + 0.9, T_W3 + 0.9):
+        add(buf, sfx_ding(0.18), at)
 
-    # fade out + normalise
-    fl = int(SR * 1.2)
+    fl = int(SR * 1.5)
     buf[-fl:] *= np.linspace(1, 0, fl)
-    buf = buf / max(1e-6, np.abs(buf).max()) * 0.8
-    pcm = (buf * 32767).astype(np.int16)
+    buf = buf / max(1e-6, np.abs(buf).max()) * 0.5
     with wave.open(path, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(SR)
-        w.writeframes(pcm.tobytes())
+        w.writeframes((buf * 32767).astype(np.int16).tobytes())
 
 
 # ---------------------------------------------------------------- main
@@ -498,28 +529,38 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     build_sprites()
     bg = background()
-    audio = os.path.join(OUT, "music.wav")
-    make_audio(audio)
+    music = os.path.join(OUT, "music.wav")
+    make_music(music)
+    voice = os.path.join(HERE, "voice", "letter_baa_voice.m4a")
+
+    # voice: trim the silent start, remove rumble/hiss, even out loudness
+    delay_ms = int(VOICE_AT * 1000)
+    filt = (f"[1:a]atrim=start={VOICE_SKIP},asetpts=PTS-STARTPTS,highpass=f=80,afftdn=nf=-25,"
+            f"acompressor=threshold=-20dB:ratio=3:attack=5:release=120,"
+            f"loudnorm=I=-16:TP=-1.5,aresample={SR},adelay={delay_ms}[v];"
+            f"[2:a]aresample={SR}[m];"
+            f"[v][m]amix=inputs=2:duration=longest:normalize=0,"
+            f"atrim=end={DUR},alimiter=limit=0.95[a]")
 
     video = os.path.join(OUT, "letter_baa.mp4")
     cmd = ["ffmpeg", "-y", "-loglevel", "error",
            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-",
-           "-i", audio,
+           "-i", voice, "-i", music, "-filter_complex", filt, "-map", "0:v", "-map", "[a]",
            "-c:v", "libx264", "-preset", "medium", "-crf", "21", "-pix_fmt", "yuv420p",
-           "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart", video]
+           "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", video]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     total = int(DUR * FPS)
     for i in range(total):
         t = i / FPS
         img = render(t, bg)
         proc.stdin.write(img.tobytes())
-        if i == int(6.5 * FPS):
+        if i == int(12.5 * FPS):
             img.save(os.path.join(OUT, "thumbnail.png"))
-        if i % 150 == 0:
+        if i % 300 == 0:
             print(f"frame {i}/{total}", flush=True)
     proc.stdin.close()
     proc.wait()
-    os.remove(audio)
+    os.remove(music)
     print("done ->", video)
 
 
