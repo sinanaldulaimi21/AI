@@ -1,14 +1,16 @@
 # ZDX Disk Space Cleanup (System Drive)
-# Version 1.0 - REMEDIATION (makes changes) - ASCII
+# Version 1.1 - REMEDIATION (makes changes) - ASCII
 # Frees as much space as safely possible on the system drive (C:).
+# Runs only when free space is at or below $RunIfFreeAtOrBelowGB.
 # Never touches user documents, Desktop, Downloads, cookies, passwords or history.
 # Run with Elevated Permissions (System Account).
 
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "1.0"
+$Version = "1.1"
 
 # ---------------- Settings ----------------
 $DryRun                    = $false  # $true = measure only, delete nothing
+$RunIfFreeAtOrBelowGB      = 20      # clean only if C: free space is this many GB or less (0 = always run)
 $TempFileAgeHours          = 24      # temp files newer than this are kept (protects running installs)
 $CleanSystemTemp           = $true   # Windows\Temp, WER reports, old CBS logs
 $CleanUserTemp             = $true   # every profile: Temp, INetCache, CrashDumps, WER
@@ -110,6 +112,7 @@ function Remove-MatchingFiles {
 
 function Invoke-CleanupStep {
     param([string]$Name, [bool]$Enabled, [scriptblock]$Action)
+    if (-not $Proceed) { return }
     if (-not $Enabled) {
         $script:Steps += [pscustomobject]@{ Name = $Name; Freed = 0; Found = 0; Files = 0; Seconds = 0; Note = "Disabled in settings" }
         return
@@ -153,6 +156,9 @@ $Profiles = @(Get-CimInstance Win32_UserProfile | Where-Object {
 $TempCutoff = (Get-Date).AddHours(-$TempFileAgeHours)
 $Now = (Get-Date).AddDays(1)   # "delete everything" cutoff
 $ServicingBusy = [bool](Get-Process -Name TiWorker -ErrorAction SilentlyContinue)
+if ($RunIfFreeAtOrBelowGB -le 0) { $ThresholdText = "Always run" }
+else { $ThresholdText = "$RunIfFreeAtOrBelowGB GB free or less" }
+$Proceed = ($RunIfFreeAtOrBelowGB -le 0) -or ($FreeBefore -le ($RunIfFreeAtOrBelowGB * 1GB))
 
 # ---------------- Cleanup steps (fast first, slow last) ----------------
 
@@ -324,12 +330,17 @@ elseif ($PctAfter -ge 10) { $Status = "OK" }
 elseif ($PctAfter -ge 5) { $Status = "LOW" }
 else { $Status = "CRITICAL" }
 if ($DryRun) { $Status = "DRY RUN (current: $Status)" }
+if (-not $Proceed) {
+    $Status = "NO ACTION NEEDED"
+    $CleanMgrState = "Not needed"
+    Add-Finding "INFO" "Free space $(Format-Size $FreeBefore) is above the $RunIfFreeAtOrBelowGB GB threshold. No cleanup was done."
+}
 
 if ($ServicingBusy) { Add-Finding "INFO" "Windows servicing (TiWorker) was running; update-related cleanup was limited. Run again later for more space." }
 if ($CleanMgrState -eq "Still running in background") { Add-Finding "INFO" "Disk Cleanup is still running. Re-check free space in 30-60 minutes." }
 
 $LargestLines = @()
-if ($PctAfter -lt 15 -and -not $DryRun) {
+if ($Proceed -and $PctAfter -lt 15 -and -not $DryRun) {
     Add-Finding "WARNING" "Free space is still below 15% after cleanup. Remaining space is likely user data or applications."
     if ($ReportLargestProfiles -and $Profiles.Count -gt 0) {
         $sizes = foreach ($p in $Profiles) {
@@ -356,7 +367,8 @@ $Lines = @(
 "Execution Time : $($StartTime.ToString('yyyy-MM-dd HH:mm:ss'))",
 "Execution Context : $Context",
 "Dry Run : $DryRun",
-"Profiles Processed : $($Profiles.Count)",
+"Run Threshold : $ThresholdText",
+"Profiles Processed : $(if($Proceed){$Profiles.Count}else{0})",
 "",
 "Disk Summary",
 "------------",
@@ -370,6 +382,8 @@ $Lines = @(
 "Cleanup Steps",
 "-------------"
 )
+
+if (-not $Proceed) { $Lines += "Not run. Free space is above the threshold." }
 
 foreach ($s in $Steps) {
     if ($s.Note -eq "Disabled in settings") {
@@ -408,4 +422,8 @@ $Output = $Lines -join [Environment]::NewLine
 
 # Same ZDX output/result API pattern as the working Employee Experience Health Check.
 Set-ZOutput $Output
+if (-not $Proceed) {
+    Set-ZResult -Status Success -Message "Disk Space Cleanup: no action needed. Free space $(Format-Size $FreeBefore) is above $RunIfFreeAtOrBelowGB GB."
+    return
+}
 Set-ZResult -Status Success -Message "Disk Space Cleanup completed. Freed $(Format-Size $TotalFreed). Free now $(Format-Size $FreeAfter) ($PctAfter%)."

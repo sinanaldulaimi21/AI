@@ -16,7 +16,9 @@ Teams_Cache_Reset_v1.0.ps1
 - User may need to sign in to Teams again.
 - Rollback: close Teams, delete the new MSTeams folder, rename the .bak_ folder back.
 
-Disk_Space_Cleanup_v1.0.ps1
+Disk_Space_Cleanup_v1.1.ps1
+- Runs only if C: has 20 GB free or less ($RunIfFreeAtOrBelowGB, 0 = always run).
+  Above that, it changes nothing and reports "NO ACTION NEEDED".
 - Cleans: Windows temp, WER reports, old CBS logs, all users' temp/INetCache/crash dumps,
   Edge/Chrome cache (not cookies/passwords/history), crash dumps, Recycle Bin (all users),
   Windows Update download cache, Delivery Optimization cache, and Windows Disk Cleanup
