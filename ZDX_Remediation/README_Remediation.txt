@@ -61,3 +61,20 @@ Safety review (v2.0):
   Leaves it alone if company policy disables it or an admin set a custom value.
 - Log folder is locked to SYSTEM/Administrators and skipped if tampered with.
 - Windows.old removal never changes file ownership or permissions.
+
+Device_Self_Heal_v1.0.ps1
+- Full health check with automatic, safe fixes and a before/after health score (0-100).
+- Fixes (each can be turned off in Settings):
+    - 16 approved Windows services: starts stopped ones, re-enables wrongly disabled ones.
+      Print Spooler and Windows Search are never re-enabled (often disabled on purpose).
+    - WMI repository: verify, then the safe "salvage" repair if inconsistent.
+    - Clock: resync if off by more than 60 seconds.
+    - DNS: flush cache if name resolution fails, then re-test.
+    - Print jobs stuck for 60+ minutes: cleared, spooler restarted.
+    - Group Policy refresh (domain devices) and Intune check-in (enrolled devices).
+    - Optional (off): DISM RestoreHealth if the Windows component store is damaged.
+- Reports only: disk space, physical disk health/wear, battery health, memory and CPU,
+  Wi-Fi signal, blue screens, unexpected shutdowns, app crashes, uptime, pending restart.
+- Output: device details, summary, results table (ID/Check/Before/Result/Detail),
+  actions taken, and numbered next steps (e.g. which other script to run).
+- Never restarts the device, never touches user files, security settings or Zscaler.
