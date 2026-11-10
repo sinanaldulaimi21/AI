@@ -1,16 +1,19 @@
 # ZDX Disk Space Cleanup (System Drive)
-# Version 1.1 - REMEDIATION (makes changes) - ASCII
+# Version 2.0 - REMEDIATION (makes changes) - ASCII
 # Frees as much space as safely possible on the system drive (C:).
 # Runs only when free space is at or below $RunIfFreeAtOrBelowGB.
 # Never touches user documents, Desktop, Downloads, cookies, passwords or history.
+# If space is still low afterwards, reports where the space went (big files,
+# old profiles, OneDrive files stored locally) so the technician knows what to ask.
 # Run with Elevated Permissions (System Account).
 
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "1.1"
+$Version = "2.0"
 
 # ---------------- Settings ----------------
 $DryRun                    = $false  # $true = measure only, delete nothing
 $RunIfFreeAtOrBelowGB      = 20      # clean only if C: free space is this many GB or less (0 = always run)
+$MaxRuntimeMinutes         = 40      # total time budget; slow steps are shortened or skipped to stay under it
 $TempFileAgeHours          = 24      # temp files newer than this are kept (protects running installs)
 $CleanSystemTemp           = $true   # Windows\Temp, WER reports, old CBS logs
 $CleanUserTemp             = $true   # every profile: Temp, INetCache, CrashDumps, WER
@@ -20,12 +23,16 @@ $CleanCrashDumps           = $true   # MEMORY.DMP, LiveKernelReports, minidumps 
 $MinidumpAgeDays           = 30
 $CleanWindowsUpdateCache   = $true   # SoftwareDistribution\Download
 $CleanDeliveryOptimization = $true   # Delivery Optimization cache
-$RunDiskCleanupTool        = $true   # cleanmgr: update cleanup, setup files, old drivers, etc.
+$RunDiskCleanupTool        = $true   # cleanmgr (or DISM component cleanup if cleanmgr is missing)
 $RemoveOldWindowsInstall   = $true   # Windows.old, only if older than $WindowsOldMinDays (removes rollback)
 $WindowsOldMinDays         = 10
 $DiskCleanupTimeoutMinutes = 25      # if cleanmgr runs longer, it keeps running in the background
 $DisableHibernation        = $false  # frees hiberfil.sys but turns off hibernate and Fast Startup
-$ReportLargestProfiles     = $true   # if still low after cleanup, list the biggest user profiles
+$RestorePointMaxPercent    = 0       # 0 = leave System Restore alone; e.g. 5 = cap restore points at 5% of C:
+$DeepReportWhenLow         = $true   # if still below 15% free, scan profiles and report where the space is
+$StaleProfileDays          = 90      # profiles unused this long are listed (never deleted)
+$BigFileGB                 = 1       # files this size or larger in user profiles are listed (never deleted)
+$WriteLocalLog             = $true   # also save the output to C:\ProgramData\ZDX\Logs on the device
 # ------------------------------------------
 
 $StartTime = Get-Date
@@ -46,6 +53,10 @@ function Format-Size {
     param([double]$Bytes)
     if ($Bytes -ge 1GB) { return ("{0:N2} GB" -f ($Bytes / 1GB)) }
     return ("{0:N0} MB" -f ($Bytes / 1MB))
+}
+
+function Get-MinutesLeft {
+    return [Math]::Max(0, $MaxRuntimeMinutes - ((Get-Date) - $StartTime).TotalMinutes)
 }
 
 function Get-DiskInfo {
@@ -145,6 +156,38 @@ function Get-RunningOwnerSids {
     return @($sids | Select-Object -Unique)
 }
 
+# Starts a process and waits up to $Minutes. Returns "Completed", "Still running in background" or "Failed to start".
+function Start-WithTimeout {
+    param([string]$Exe, [string]$Arguments, [double]$Minutes)
+    $proc = Start-Process -FilePath $Exe -ArgumentList $Arguments -WindowStyle Hidden -PassThru
+    if (-not $proc) { return "Failed to start" }
+    if ($proc.WaitForExit([int]($Minutes * 60 * 1000))) { return "Completed" }
+    return "Still running in background"
+}
+
+function Get-PendingReboot {
+    $r = @()
+    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") { $r += "Windows servicing" }
+    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") { $r += "Windows Update" }
+    $pfr = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name PendingFileRenameOperations).PendingFileRenameOperations
+    if ($pfr) { $r += "Pending file operations" }
+    return $r
+}
+
+function Write-LocalLog {
+    param([string]$Name, [string]$Text)
+    try {
+        $dir = Join-Path $env:ProgramData "ZDX\Logs"
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $file = Join-Path $dir "$Name.log"
+        if ((Test-Path -LiteralPath $file) -and (Get-Item -LiteralPath $file).Length -gt 2MB) {
+            Move-Item -LiteralPath $file -Destination "$file.old" -Force
+        }
+        Add-Content -LiteralPath $file -Value ($Text + [Environment]::NewLine) -Encoding ASCII
+        return $file
+    } catch { return $null }
+}
+
 # ---------------- Discovery ----------------
 $Context = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $Disk = Get-DiskInfo
@@ -156,6 +199,7 @@ $Profiles = @(Get-CimInstance Win32_UserProfile | Where-Object {
 $TempCutoff = (Get-Date).AddHours(-$TempFileAgeHours)
 $Now = (Get-Date).AddDays(1)   # "delete everything" cutoff
 $ServicingBusy = [bool](Get-Process -Name TiWorker -ErrorAction SilentlyContinue)
+$PendingReboot = @(Get-PendingReboot)
 if ($RunIfFreeAtOrBelowGB -le 0) { $ThresholdText = "Always run" }
 else { $ThresholdText = "$RunIfFreeAtOrBelowGB GB free or less" }
 $Proceed = ($RunIfFreeAtOrBelowGB -le 0) -or ($FreeBefore -le ($RunIfFreeAtOrBelowGB * 1GB))
@@ -262,10 +306,32 @@ Invoke-CleanupStep "Hibernation file" $DisableHibernation {
     Set-StepNote "Hibernate and Fast Startup turned off"
 }
 
+Invoke-CleanupStep "System Restore storage cap" ($RestorePointMaxPercent -gt 0) {
+    if ($DryRun) { Set-StepNote "Dry run: would cap restore points at $RestorePointMaxPercent% of $Drive"; return }
+    $out = & "$env:SystemRoot\System32\vssadmin.exe" resize shadowstorage /For=$Drive /On=$Drive /MaxSize=$RestorePointMaxPercent% 2>&1 | Out-String
+    if ($out -match '(?i)success') { Set-StepNote "Capped at $RestorePointMaxPercent% (oldest restore points removed if over the cap)" }
+    elseif ($out -match '(?i)no items found|not found') { Set-StepNote "No restore point storage on $Drive" }
+    else { Set-StepNote "vssadmin did not confirm the change" }
+}
+
 $CleanMgrState = "Not run"
-Invoke-CleanupStep "Windows Disk Cleanup (cleanmgr)" $RunDiskCleanupTool {
+Invoke-CleanupStep "Windows Disk Cleanup" $RunDiskCleanupTool {
+    $budget = [Math]::Min($DiskCleanupTimeoutMinutes, (Get-MinutesLeft) - 3)
+    if ($budget -lt 2) {
+        Set-StepNote "Skipped (time budget of $MaxRuntimeMinutes min nearly used)"
+        $script:CleanMgrState = "Skipped (time budget)"
+        return
+    }
+
     $exe = "$env:SystemRoot\System32\cleanmgr.exe"
-    if (-not (Test-Path -LiteralPath $exe)) { Set-StepNote "cleanmgr.exe not found"; $script:CleanMgrState = "Not available"; return }
+    if (-not (Test-Path -LiteralPath $exe)) {
+        # Fallback for builds without cleanmgr: component store cleanup only.
+        if ($DryRun) { $script:CleanMgrState = "Dry run (DISM fallback)"; return }
+        $dism = "$env:SystemRoot\System32\Dism.exe"
+        $script:CleanMgrState = "DISM: " + (Start-WithTimeout $dism "/Online /Cleanup-Image /StartComponentCleanup /Quiet" $budget)
+        Set-StepNote "cleanmgr not found; used DISM component cleanup"
+        return
+    }
 
     $vc = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches"
     $flag = "StateFlags0777"
@@ -292,7 +358,7 @@ Invoke-CleanupStep "Windows Disk Cleanup (cleanmgr)" $RunDiskCleanupTool {
         }
     }
 
-    if ($DryRun) { Set-StepNote "Dry run: cleanmgr not started"; $script:CleanMgrState = "Dry run"; return }
+    if ($DryRun) { Set-StepNote "Dry run: Disk Cleanup not started"; $script:CleanMgrState = "Dry run"; return }
 
     # Clear any old selection under this ID, then select only our handlers.
     Get-ChildItem -LiteralPath $vc | ForEach-Object { Remove-ItemProperty -LiteralPath $_.PSPath -Name $flag -ErrorAction SilentlyContinue }
@@ -301,16 +367,11 @@ Invoke-CleanupStep "Windows Disk Cleanup (cleanmgr)" $RunDiskCleanupTool {
         if (Test-Path -LiteralPath $k) { New-ItemProperty -LiteralPath $k -Name $flag -Value 2 -PropertyType DWord -Force | Out-Null }
     }
 
-    $proc = Start-Process -FilePath $exe -ArgumentList "/sagerun:777" -WindowStyle Hidden -PassThru
-    if ($proc -and $proc.WaitForExit($DiskCleanupTimeoutMinutes * 60 * 1000)) {
-        $script:CleanMgrState = "Completed"
+    $script:CleanMgrState = Start-WithTimeout $exe "/sagerun:777" $budget
+    if ($script:CleanMgrState -eq "Completed") {
         Get-ChildItem -LiteralPath $vc | ForEach-Object { Remove-ItemProperty -LiteralPath $_.PSPath -Name $flag -ErrorAction SilentlyContinue }
-    } elseif ($proc) {
-        $script:CleanMgrState = "Still running in background"
-        Set-StepNote "Still running after $DiskCleanupTimeoutMinutes min; more space will be freed when it finishes"
-    } else {
-        $script:CleanMgrState = "Failed to start"
-        Set-StepNote "cleanmgr failed to start"
+    } elseif ($script:CleanMgrState -eq "Still running in background") {
+        Set-StepNote "Still running after $([int]$budget) min; more space will be freed when it finishes"
     }
 }
 
@@ -320,6 +381,8 @@ $FreeAfter = $Disk.Free
 $TotalFreed = [Math]::Max(0, $FreeAfter - $FreeBefore)
 $FoundTotal = ($Steps | Measure-Object Found -Sum).Sum
 $FilesTotal = ($Steps | Measure-Object Files -Sum).Sum
+if (-not $FoundTotal) { $FoundTotal = 0 }
+if (-not $FilesTotal) { $FilesTotal = 0 }
 if ($DiskSize -gt 0) {
     $PctBefore = [Math]::Round(($FreeBefore / $DiskSize) * 100, 1)
     $PctAfter = [Math]::Round(($FreeAfter / $DiskSize) * 100, 1)
@@ -336,22 +399,71 @@ if (-not $Proceed) {
     Add-Finding "INFO" "Free space $(Format-Size $FreeBefore) is above the $RunIfFreeAtOrBelowGB GB threshold. No cleanup was done."
 }
 
-if ($ServicingBusy) { Add-Finding "INFO" "Windows servicing (TiWorker) was running; update-related cleanup was limited. Run again later for more space." }
+if ($PendingReboot.Count -gt 0) {
+    Add-Finding "INFO" "Restart pending ($($PendingReboot -join ', ')). A restart can free more space and lets update cleanup finish."
+}
+if ($Proceed -and $ServicingBusy) { Add-Finding "INFO" "Windows servicing (TiWorker) was running; update-related cleanup was limited. Run again later for more space." }
 if ($CleanMgrState -eq "Still running in background") { Add-Finding "INFO" "Disk Cleanup is still running. Re-check free space in 30-60 minutes." }
 
-$LargestLines = @()
+# ---------------- Deep report: where is the remaining space? ----------------
+$ProfileLines = @()
+$BigFileLines = @()
+$StaleLines = @()
+$OneDriveLines = @()
 if ($Proceed -and $PctAfter -lt 15 -and -not $DryRun) {
     Add-Finding "WARNING" "Free space is still below 15% after cleanup. Remaining space is likely user data or applications."
-    if ($ReportLargestProfiles -and $Profiles.Count -gt 0) {
-        $sizes = foreach ($p in $Profiles) {
-            [pscustomobject]@{
-                Path      = $p.LocalPath
-                Total     = Get-FolderSize $p.LocalPath
-                Downloads = Get-FolderSize (Join-Path $p.LocalPath "Downloads")
+    if ($DeepReportWhenLow -and $Profiles.Count -gt 0) {
+        if ((Get-MinutesLeft) -lt 4) {
+            Add-Finding "INFO" "Detailed space report skipped to stay inside the $MaxRuntimeMinutes minute time budget."
+        } else {
+            $RecallMask = 0x400000 -bor 0x1000   # cloud-only (not stored locally) / offline
+            $BigBytes = $BigFileGB * 1GB
+            $big = New-Object System.Collections.ArrayList
+            $stats = @()
+            foreach ($p in $Profiles) {
+                $root = $p.LocalPath
+                $dl = Join-Path $root "Downloads"
+                $odRoots = @(Get-ChildItem -LiteralPath $root -Directory -Force | Where-Object { $_.Name -like "OneDrive*" } | ForEach-Object { $_.FullName })
+                $total = 0.0; $dlSize = 0.0; $odSize = 0.0
+                Get-ChildItem -LiteralPath $root -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object {
+                    if ([int]$_.Attributes -band $RecallMask) { return }   # cloud-only file, uses no local space
+                    $len = [double]$_.Length
+                    $total += $len
+                    $fp = $_.FullName
+                    if ($fp.StartsWith($dl + "\", [StringComparison]::OrdinalIgnoreCase)) { $dlSize += $len }
+                    foreach ($od in $odRoots) { if ($fp.StartsWith($od + "\", [StringComparison]::OrdinalIgnoreCase)) { $odSize += $len; break } }
+                    if ($len -ge $BigBytes) { [void]$big.Add([pscustomobject]@{ Path = $fp; Size = $len; Modified = $_.LastWriteTime }) }
+                }
+                $lastUse = $null
+                if ($p.LastUseTime) { $lastUse = [datetime]$p.LastUseTime }
+                $stats += [pscustomobject]@{
+                    Path = $root; Total = $total; Downloads = $dlSize; OneDrive = $odSize
+                    Loaded = [bool]$p.Loaded; LastUse = $lastUse
+                }
             }
-        }
-        foreach ($s in @($sizes | Sort-Object Total -Descending | Select-Object -First 5)) {
-            $LargestLines += "$($s.Path) : $(Format-Size $s.Total) (Downloads: $(Format-Size $s.Downloads))"
+
+            foreach ($s in @($stats | Sort-Object Total -Descending | Select-Object -First 5)) {
+                $ProfileLines += "$($s.Path) : $(Format-Size $s.Total) (Downloads: $(Format-Size $s.Downloads), OneDrive local: $(Format-Size $s.OneDrive))"
+            }
+            foreach ($s in @($stats | Where-Object { $_.OneDrive -ge 5GB } | Sort-Object OneDrive -Descending)) {
+                $OneDriveLines += "$($s.Path) : $(Format-Size $s.OneDrive) of OneDrive files stored on this PC"
+            }
+            foreach ($f in @($big | Sort-Object Size -Descending | Select-Object -First 10)) {
+                $BigFileLines += "$(Format-Size $f.Size) : $($f.Path) (modified $($f.Modified.ToString('yyyy-MM-dd')))"
+            }
+            foreach ($s in @($stats | Where-Object { -not $_.Loaded -and $_.LastUse -and $_.LastUse -lt (Get-Date).AddDays(-$StaleProfileDays) } | Sort-Object Total -Descending)) {
+                $StaleLines += "$($s.Path) : $(Format-Size $s.Total), last used $($s.LastUse.ToString('yyyy-MM-dd'))"
+            }
+
+            if ($OneDriveLines.Count -gt 0) {
+                Add-Finding "INFO" "Large OneDrive folders are stored locally. Ask the user to right-click the OneDrive folder and choose 'Free up space'."
+            }
+            if ($StaleLines.Count -gt 0) {
+                Add-Finding "INFO" "$($StaleLines.Count) profile(s) unused for $StaleProfileDays+ days. Review and remove them through System Properties if no longer needed."
+            }
+            if ($BigFileLines.Count -gt 0) {
+                Add-Finding "INFO" "Large files found in user profiles. Ask the user whether they can be deleted or moved to OneDrive."
+            }
         }
     }
 }
@@ -369,6 +481,7 @@ $Lines = @(
 "Dry Run : $DryRun",
 "Run Threshold : $ThresholdText",
 "Profiles Processed : $(if($Proceed){$Profiles.Count}else{0})",
+"Restart Pending : $(if($PendingReboot.Count -gt 0){'Yes (' + ($PendingReboot -join ', ') + ')'}else{'No'})",
 "",
 "Disk Summary",
 "------------",
@@ -398,11 +511,29 @@ foreach ($s in $Steps) {
     $Lines += $line
 }
 
-if ($LargestLines.Count -gt 0) {
+if ($ProfileLines.Count -gt 0) {
     $Lines += ""
-    $Lines += "Largest User Profiles (approximate)"
-    $Lines += "-----------------------------------"
-    $Lines += $LargestLines
+    $Lines += "Largest User Profiles (local files only)"
+    $Lines += "----------------------------------------"
+    $Lines += $ProfileLines
+}
+if ($OneDriveLines.Count -gt 0) {
+    $Lines += ""
+    $Lines += "OneDrive Files Stored Locally (5 GB+)"
+    $Lines += "-------------------------------------"
+    $Lines += $OneDriveLines
+}
+if ($BigFileLines.Count -gt 0) {
+    $Lines += ""
+    $Lines += "Largest Files In User Profiles ($BigFileGB GB+, top 10)"
+    $Lines += "-------------------------------------------------"
+    $Lines += $BigFileLines
+}
+if ($StaleLines.Count -gt 0) {
+    $Lines += ""
+    $Lines += "Profiles Unused For $StaleProfileDays+ Days (not deleted)"
+    $Lines += "-----------------------------------------------"
+    $Lines += $StaleLines
 }
 
 $Lines += ""
@@ -420,10 +551,12 @@ $Lines += "============================================================"
 
 $Output = $Lines -join [Environment]::NewLine
 
+if ($WriteLocalLog) { [void](Write-LocalLog "Disk_Space_Cleanup" $Output) }
+
 # Same ZDX output/result API pattern as the working Employee Experience Health Check.
 Set-ZOutput $Output
 if (-not $Proceed) {
     Set-ZResult -Status Success -Message "Disk Space Cleanup: no action needed. Free space $(Format-Size $FreeBefore) is above $RunIfFreeAtOrBelowGB GB."
-    return
+} else {
+    Set-ZResult -Status Success -Message "Disk Space Cleanup completed. Freed $(Format-Size $TotalFreed). Free now $(Format-Size $FreeAfter) ($PctAfter%)."
 }
-Set-ZResult -Status Success -Message "Disk Space Cleanup completed. Freed $(Format-Size $TotalFreed). Free now $(Format-Size $FreeAfter) ($PctAfter%)."

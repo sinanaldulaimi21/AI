@@ -1,23 +1,28 @@
 # ZDX Teams Cache Reset
-# Version 1.0 - REMEDIATION (makes changes) - ASCII
+# Version 2.0 - REMEDIATION (makes changes) - ASCII
 # Closes Teams for the logged-on user, renames the Teams cache folder
-# (a backup is kept), and reopens Teams if it was running before.
+# (a backup is kept), reopens Teams if it was running before, and repairs
+# the Teams Meeting add-in for Outlook. Reports Teams health before/after.
 # Run with Elevated Permissions (System Account).
 
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "1.0"
+$Version = "2.0"
 
 # ---------------- Settings ----------------
-$DryRun        = $false   # $true = report only, change nothing
-$SkipIfInCall  = $true    # do nothing if Teams is using the mic/camera (user in a call)
-$RelaunchTeams = $true    # reopen Teams for the user if it was running before the reset
-$KeepBackups   = 1        # cache backups to keep per folder (older ones are deleted)
+$DryRun          = $false   # $true = report only, change nothing
+$SkipIfInCall    = $true    # do nothing to Teams if it is using the mic/camera (user in a call)
+$RelaunchTeams   = $true    # reopen Teams for the user if it was running before the reset
+$KeepBackups     = 1        # cache backups to keep per folder (older ones are deleted)
+$FixOutlookAddin = $true    # re-enable the Teams Meeting add-in in Outlook if it is disabled
+$EventDays       = 7        # look-back window for Teams crash/hang events
+$WriteLocalLog   = $true    # also save the output to C:\ProgramData\ZDX\Logs on the device
 # ------------------------------------------
 
 $StartTime = Get-Date
 $Stamp = $StartTime.ToString("yyyyMMdd_HHmmss")
 $Findings = @()
 $Actions = @()
+$AddinProgId = "TeamsAddin.FastConnect"
 
 function Add-Finding {
     param([string]$Severity, [string]$Message)
@@ -105,6 +110,29 @@ function Test-TeamsInCall {
     return $false
 }
 
+function Get-TeamsEvents {
+    param([int]$EventId)
+    try {
+        return @(Get-WinEvent -FilterHashtable @{
+            LogName = "Application"; Id = $EventId; StartTime = (Get-Date).AddDays(-$EventDays)
+        } -ErrorAction Stop | Where-Object { [string]$_.Message -match 'ms-teams\.exe|Teams\.exe' })
+    } catch { return @() }
+}
+
+function Get-WebView2Version {
+    foreach ($p in @(
+        "${env:ProgramFiles(x86)}\Microsoft\EdgeWebView\Application",
+        "$env:ProgramFiles\Microsoft\EdgeWebView\Application"
+    ) | Where-Object { $_ }) {
+        if (Test-Path -LiteralPath $p) {
+            $v = Get-ChildItem -LiteralPath $p -Directory | Where-Object { $_.Name -match '^\d+\.' } |
+                 Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+            if ($v) { return $v.Name }
+        }
+    }
+    return "Not Detected"
+}
+
 function Rename-WithRetry {
     param([string]$Path, [string]$NewName)
     for ($i = 1; $i -le 4; $i++) {
@@ -146,6 +174,33 @@ function Start-AppForUser {
     }
 }
 
+# Returns the add-in registration keys that exist (user and machine level).
+function Get-AddinKeys {
+    param([string]$Sid)
+    $keys = @()
+    $candidates = @(
+        "HKLM:\SOFTWARE\Microsoft\Office\Outlook\Addins\$AddinProgId",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\Outlook\Addins\$AddinProgId"
+    )
+    if ($Sid) { $candidates = @("Registry::HKEY_USERS\$Sid\Software\Microsoft\Office\Outlook\Addins\$AddinProgId") + $candidates }
+    foreach ($k in $candidates) { if (Test-Path -LiteralPath $k) { $keys += $k } }
+    return $keys
+}
+
+function Write-LocalLog {
+    param([string]$Name, [string]$Text)
+    try {
+        $dir = Join-Path $env:ProgramData "ZDX\Logs"
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $file = Join-Path $dir "$Name.log"
+        if ((Test-Path -LiteralPath $file) -and (Get-Item -LiteralPath $file).Length -gt 2MB) {
+            Move-Item -LiteralPath $file -Destination "$file.old" -Force
+        }
+        Add-Content -LiteralPath $file -Value ($Text + [Environment]::NewLine) -Encoding ASCII
+        return $file
+    } catch { return $null }
+}
+
 # ---------------- Discovery ----------------
 $Context = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $User = Get-InteractiveUser
@@ -157,6 +212,7 @@ if ($ProfileInfo) { $ProfilePath = $ProfileInfo.Path; $Sid = $ProfileInfo.SID }
 $NewCache = $null
 $ClassicCache = $null
 $NewTeamsVersion = "Not Detected"
+$PackageStatus = "Not Detected"
 $ClassicDetected = "No"
 
 if ($ProfilePath) {
@@ -167,8 +223,18 @@ if ($ProfilePath) {
 }
 try {
     $pkg = Get-AppxPackage -AllUsers -Name MSTeams | Sort-Object Version -Descending | Select-Object -First 1
-    if ($pkg) { $NewTeamsVersion = [string]$pkg.Version }
+    if ($pkg) {
+        $NewTeamsVersion = [string]$pkg.Version
+        $PackageStatus = [string]$pkg.Status
+        if (-not $PackageStatus) { $PackageStatus = "Unknown" }
+    }
 } catch {}
+
+$WebView2 = Get-WebView2Version
+$Crashes = @(Get-TeamsEvents 1000)
+$Hangs = @(Get-TeamsEvents 1002)
+$LastEvent = @(@($Crashes) + @($Hangs) | Where-Object { $_ -and $_.TimeCreated } | Sort-Object TimeCreated -Descending | Select-Object -First 1)
+if ($LastEvent.Count -gt 0) { $LastEventTime = $LastEvent[0].TimeCreated.ToString("yyyy-MM-dd HH:mm:ss") } else { $LastEventTime = "None" }
 
 $NewCacheSize = Get-FolderSize $NewCache
 $ClassicCacheSize = Get-FolderSize $ClassicCache
@@ -178,9 +244,21 @@ $NewWasRunning = @($Before | Where-Object { $_.ProcessName -ieq "ms-teams" }).Co
 $ClassicWasRunning = @($Before | Where-Object { $_.ProcessName -ieq "Teams" }).Count -gt 0
 $InCall = Test-TeamsInCall $Sid
 
-# ---------------- Decide ----------------
+# Health findings (informational, independent of the reset)
+if ($WebView2 -eq "Not Detected" -and $NewTeamsVersion -ne "Not Detected") {
+    Add-Finding "WARNING" "WebView2 runtime not found. New Teams needs it; reinstall WebView2 if Teams stays blank after the reset."
+}
+if ($PackageStatus -notin @("Ok","Not Detected","Unknown")) {
+    Add-Finding "WARNING" "Teams app package status is '$PackageStatus'. If problems continue after the reset, reinstall Teams."
+}
+if (($Crashes.Count + $Hangs.Count) -ge 3) {
+    Add-Finding "WARNING" "$($Crashes.Count) crash(es) and $($Hangs.Count) hang(s) in $EventDays days. Re-check in a few days to confirm the reset fixed it."
+}
+
+# ---------------- Decide and remediate Teams cache ----------------
 $Status = "NO ACTION"
 $Relaunch = "Not needed"
+$CacheRebuilt = "N/A"
 $NewResult = "Not found"
 $ClassicResult = "Not found"
 if ($NewCache) { $NewResult = "Pending" }
@@ -191,7 +269,7 @@ if ($User -in @("Unknown","No Interactive User")) {
 } elseif (-not $ProfilePath) {
     Add-Finding "WARNING" "User profile for $User could not be found. Nothing was changed."
 } elseif (-not $NewCache -and -not $ClassicCache) {
-    Add-Finding "INFO" "No Teams cache folder found for $User. Nothing was changed."
+    Add-Finding "INFO" "No Teams cache folder found for $User."
 } elseif ($SkipIfInCall -and $InCall) {
     $Status = "SKIPPED - USER IN CALL"
     if ($NewCache) { $NewResult = "Skipped" }
@@ -201,9 +279,7 @@ if ($User -in @("Unknown","No Interactive User")) {
     $Status = "DRY RUN"
     if ($NewCache) { $NewResult = "Would rename (dry run)" }
     if ($ClassicCache) { $ClassicResult = "Would rename (dry run)" }
-    Add-Finding "INFO" "Dry run. Teams would be closed and the cache renamed. Nothing was changed."
 } else {
-    # ---------------- Remediate ----------------
     if ($Before.Count -gt 0) {
         $Before | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
         Add-Action "Closed $($Before.Count) Teams process(es) for $User"
@@ -250,7 +326,6 @@ if ($User -in @("Unknown","No Interactive User")) {
     elseif ($ok -gt 0) { $Status = "PARTIAL" }
     else { $Status = "FAILED" }
 
-    # ---------------- Relaunch ----------------
     if ($RelaunchTeams -and ($NewWasRunning -or $ClassicWasRunning)) {
         $started = $false
         if ($NewWasRunning) {
@@ -267,6 +342,13 @@ if ($User -in @("Unknown","No Interactive User")) {
         if ($running) {
             $Relaunch = "Teams reopened for the user"
             Add-Action "Teams reopened for $User"
+            if ($NewCache) {
+                for ($i = 0; $i -lt 10; $i++) {
+                    if (Test-Path -LiteralPath $NewCache) { break }
+                    Start-Sleep -Seconds 2
+                }
+                if (Test-Path -LiteralPath $NewCache) { $CacheRebuilt = "Yes" } else { $CacheRebuilt = "Not yet (Teams still starting)" }
+            }
         } else {
             $Relaunch = "Could not confirm. Ask the user to open Teams."
             Add-Finding "INFO" "Teams relaunch could not be confirmed (task started: $started). Ask the user to open Teams."
@@ -277,7 +359,45 @@ if ($User -in @("Unknown","No Interactive User")) {
         $Relaunch = "Teams was not running, so it was not reopened"
     }
 
-    Add-Finding "INFO" "The user may need to sign in to Teams again. Teams rebuilds the cache on first start, so the first launch can be slower."
+    Add-Finding "INFO" "The user may need to sign in to Teams again. The first launch after a reset can be slower."
+}
+
+# ---------------- Outlook Teams Meeting add-in ----------------
+$AddinState = "Not checked"
+if ($User -notin @("Unknown","No Interactive User") -and $Sid) {
+    $addinKeys = @(Get-AddinKeys $Sid)
+    if ($addinKeys.Count -eq 0) {
+        $AddinState = "Not registered"
+        Add-Finding "INFO" "Teams Meeting add-in for Outlook is not registered. If the Teams Meeting button is missing, reinstall or repair Teams."
+    } else {
+        $disabled = @($addinKeys | Where-Object { (Get-ItemProperty -LiteralPath $_).LoadBehavior -ne 3 })
+        $resKey = "Registry::HKEY_USERS\$Sid\Software\Microsoft\Office\16.0\Outlook\Resiliency\DoNotDisableAddinList"
+        $protected = ((Get-ItemProperty -LiteralPath $resKey).$AddinProgId -eq 1)
+
+        if ($disabled.Count -eq 0 -and $protected) {
+            $AddinState = "Enabled"
+        } elseif (-not $FixOutlookAddin -or $DryRun) {
+            if ($disabled.Count -gt 0) { $AddinState = "Disabled (not fixed: dry run or setting off)" }
+            else { $AddinState = "Enabled (not protected from auto-disable)" }
+        } else {
+            foreach ($k in $disabled) {
+                Set-ItemProperty -LiteralPath $k -Name LoadBehavior -Value 3 -Type DWord -ErrorAction SilentlyContinue
+            }
+            if (-not $protected) {
+                if (-not (Test-Path -LiteralPath $resKey)) { New-Item -Path $resKey -Force | Out-Null }
+                New-ItemProperty -LiteralPath $resKey -Name $AddinProgId -Value 1 -PropertyType DWord -Force | Out-Null
+            }
+            $still = @($addinKeys | Where-Object { (Get-ItemProperty -LiteralPath $_).LoadBehavior -ne 3 })
+            if ($still.Count -eq 0) {
+                $AddinState = "Repaired (takes effect when Outlook restarts)"
+                if ($disabled.Count -gt 0) { Add-Action "Re-enabled Teams Meeting add-in for Outlook ($($disabled.Count) key(s))" }
+                if (-not $protected) { Add-Action "Protected Teams Meeting add-in from being auto-disabled by Outlook" }
+            } else {
+                $AddinState = "Repair failed"
+                Add-Finding "WARNING" "Could not re-enable the Teams Meeting add-in."
+            }
+        }
+    }
 }
 
 # ---------------- Output ----------------
@@ -295,9 +415,17 @@ $Lines = @(
 "User Profile : $(if($ProfilePath){$ProfilePath}else{'Unavailable'})",
 "Dry Run : $DryRun",
 "",
+"Teams Health",
+"------------",
+"New Teams Version : $NewTeamsVersion",
+"App Package Status : $PackageStatus",
+"WebView2 Runtime : $WebView2",
+"Crashes ($EventDays days) : $($Crashes.Count)",
+"Hangs ($EventDays days) : $($Hangs.Count)",
+"Last Crash/Hang : $LastEventTime",
+"",
 "Before",
 "------",
-"New Teams Version : $NewTeamsVersion",
 "New Teams Running : $(if($NewWasRunning){'Yes'}else{'No'})",
 "New Teams Cache : $(if($NewCache){Format-Size $NewCacheSize}else{'Not found'})",
 "Classic Teams Found : $ClassicDetected",
@@ -310,6 +438,8 @@ $Lines = @(
 "New Teams Cache : $NewResult",
 "Classic Teams Cache : $ClassicResult",
 "Teams Relaunch : $Relaunch",
+"Cache Rebuilt : $CacheRebuilt",
+"Outlook Teams Add-in : $AddinState",
 "",
 "Actions Taken",
 "-------------"
@@ -331,6 +461,8 @@ $Lines += "============================================================"
 
 $Output = $Lines -join [Environment]::NewLine
 
+if ($WriteLocalLog) { [void](Write-LocalLog "Teams_Cache_Reset" $Output) }
+
 # Same ZDX output/result API pattern as the working Employee Experience Health Check.
 Set-ZOutput $Output
-Set-ZResult -Status Success -Message "Teams Cache Reset completed. Status: $Status"
+Set-ZResult -Status Success -Message "Teams Cache Reset completed. Status: $Status. Outlook add-in: $AddinState"
