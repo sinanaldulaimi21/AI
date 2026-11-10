@@ -1,5 +1,6 @@
 # ZDX Teams Cache Reset
 # Version 2.0 - REMEDIATION (makes changes) - ASCII
+# Created by: Sinan Aldulaimi
 # Closes Teams for the logged-on user, renames the Teams cache folder
 # (a backup is kept), reopens Teams if it was running before, and repairs
 # the Teams Meeting add-in for Outlook. Reports Teams health before/after.

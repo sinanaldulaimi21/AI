@@ -1,5 +1,6 @@
 # ZDX Disk Space Cleanup (System Drive)
 # Version 2.0 - REMEDIATION (makes changes) - ASCII
+# Created by: Sinan Aldulaimi
 # Frees as much space as safely possible on the system drive (C:).
 # Runs only when free space is at or below $RunIfFreeAtOrBelowGB.
 # Never touches user documents, Desktop, Downloads, cookies, passwords or history.
