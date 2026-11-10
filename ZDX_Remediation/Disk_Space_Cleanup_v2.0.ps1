@@ -24,8 +24,8 @@ $MinidumpAgeDays           = 30
 $CleanWindowsUpdateCache   = $true   # SoftwareDistribution\Download
 $CleanDeliveryOptimization = $true   # Delivery Optimization cache
 $RunDiskCleanupTool        = $true   # cleanmgr (or DISM component cleanup if cleanmgr is missing)
-$RemoveOldWindowsInstall   = $true   # Windows.old, only if older than $WindowsOldMinDays (removes rollback)
-$WindowsOldMinDays         = 10
+$RemoveOldWindowsInstall   = $true   # Windows.old + upgrade leftovers, only if older than $WindowsOldMinDays (removes rollback)
+$WindowsOldMinDays         = 10      # 0 = remove even right after an upgrade
 $DiskCleanupTimeoutMinutes = 25      # if cleanmgr runs longer, it keeps running in the background
 $DisableHibernation        = $false  # frees hiberfil.sys but turns off hibernate and Fast Startup
 $RestorePointMaxPercent    = 0       # 0 = leave System Restore alone; e.g. 5 = cap restore points at 5% of C:
@@ -174,6 +174,70 @@ function Get-PendingReboot {
     return $r
 }
 
+# Size of a folder tree without following junctions/symlinks (Windows.old contains
+# links that point back to live folders such as C:\Users).
+function Get-TreeSize {
+    param([string]$Path)
+    $total = 0.0
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($Path)
+    while ($stack.Count -gt 0) {
+        $d = $stack.Pop()
+        try { $entries = ([IO.DirectoryInfo]$d).GetFileSystemInfos() } catch { continue }
+        foreach ($e in $entries) {
+            if ($e.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+            if ($e.Attributes -band [IO.FileAttributes]::Directory) { $stack.Push($e.FullName) }
+            else { $total += [double]$e.Length }
+        }
+    }
+    return $total
+}
+
+# Deletes an old-Windows/upgrade folder that Disk Cleanup did not remove.
+# Only the fixed folder names below are allowed. Links inside the folder are removed
+# first, so taking ownership and deleting can never reach live folders like C:\Users.
+function Remove-UpgradeFolder {
+    param([string]$Path)
+    $allowed = @("$Drive\Windows.old", "$Drive\`$WINDOWS.~BT", "$Drive\`$Windows.~WS", "$Drive\`$GetCurrent")
+    if ($allowed -notcontains $Path) { return "Refused (path not allowed)" }
+    if (-not (Test-Path -LiteralPath $Path)) { return "Removed" }
+    $cmd = "$env:SystemRoot\System32\cmd.exe"
+
+    for ($pass = 0; $pass -lt 3; $pass++) {
+        $links = @(& $cmd /c "dir /AL /S /B `"$Path`"" 2>$null | Where-Object { $_ })
+        if ($links.Count -eq 0) { break }
+        # Shortest paths first, so an outer link is removed before anything reached through it.
+        foreach ($l in @($links | Sort-Object Length)) {
+            if (-not $l.StartsWith($Path + "\", [StringComparison]::OrdinalIgnoreCase)) { continue }
+            # Skip anything reached through another link (it disappears when that link is removed).
+            $throughLink = $false
+            $parent = Split-Path $l -Parent
+            while ($parent -and $parent.Length -gt $Path.Length) {
+                $pa = ([IO.FileInfo]$parent).Attributes
+                if ([int]$pa -ne -1 -and ($pa -band [IO.FileAttributes]::ReparsePoint)) { $throughLink = $true; break }
+                $parent = Split-Path $parent -Parent
+            }
+            if ($throughLink) { continue }
+            # Attributes of the link itself (not its target).
+            $a = ([IO.FileInfo]$l).Attributes
+            if ([int]$a -eq -1 -or -not ($a -band [IO.FileAttributes]::ReparsePoint)) { continue }
+            # rmdir on a folder link and del on a file link remove only the link, never its target.
+            if ($a -band [IO.FileAttributes]::Directory) { & $cmd /c "rmdir `"$l`"" 2>$null | Out-Null }
+            else { & $cmd /c "del /f /q /a `"$l`"" 2>$null | Out-Null }
+        }
+    }
+    $left = @(& $cmd /c "dir /AL /S /B `"$Path`"" 2>$null | Where-Object { $_ })
+    if ($left.Count -gt 0) { return "Stopped: $($left.Count) link(s) inside could not be removed safely" }
+
+    # /D Y answers the takeown prompt on English Windows.
+    & "$env:SystemRoot\System32\takeown.exe" /F $Path /R /A /D Y 2>&1 | Out-Null
+    & "$env:SystemRoot\System32\icacls.exe" $Path /grant "*S-1-5-32-544:(OI)(CI)F" /T /C /Q 2>&1 | Out-Null
+    & $cmd /c "rd /s /q `"$Path`"" 2>&1 | Out-Null
+
+    if (Test-Path -LiteralPath $Path) { return "Partly removed (some files locked; restart and run again)" }
+    return "Removed"
+}
+
 function Write-LocalLog {
     param([string]$Name, [string]$Text)
     try {
@@ -203,6 +267,23 @@ $PendingReboot = @(Get-PendingReboot)
 if ($RunIfFreeAtOrBelowGB -le 0) { $ThresholdText = "Always run" }
 else { $ThresholdText = "$RunIfFreeAtOrBelowGB GB free or less" }
 $Proceed = ($RunIfFreeAtOrBelowGB -le 0) -or ($FreeBefore -le ($RunIfFreeAtOrBelowGB * 1GB))
+
+# Old Windows installation and upgrade leftovers
+$SetupBusy = [bool](Get-Process -Name SetupHost,SetupPrep -ErrorAction SilentlyContinue)
+$UpgradeFolders = @()
+foreach ($name in @("Windows.old", "`$WINDOWS.~BT", "`$Windows.~WS", "`$GetCurrent")) {
+    $path = "$Drive\$name"
+    if (-not (Test-Path -LiteralPath $path)) { continue }
+    $gi = Get-Item -LiteralPath $path -Force
+    $newest = $gi.CreationTime
+    if ($gi.LastWriteTime -gt $newest) { $newest = $gi.LastWriteTime }
+    $size = 0
+    if ($Proceed) { $size = Get-TreeSize $path }
+    $UpgradeFolders += [pscustomobject]@{
+        Name = $name; Path = $path; AgeDays = [int]((Get-Date) - $newest).TotalDays
+        Size = $size; Result = "Pending"
+    }
+}
 
 # ---------------- Cleanup steps (fast first, slow last) ----------------
 
@@ -345,17 +426,10 @@ Invoke-CleanupStep "Windows Disk Cleanup" $RunDiskCleanupTool {
     )
     if ($CleanCrashDumps) { $handlers += "System error memory dump files" }
 
-    $wo = "$Drive\Windows.old"
-    if (Test-Path -LiteralPath $wo) {
-        $age = [int]((Get-Date) - (Get-Item -LiteralPath $wo -Force).CreationTime).TotalDays
-        if (-not $RemoveOldWindowsInstall) {
-            Set-StepNote "Windows.old kept (disabled in settings)"
-        } elseif ($age -ge $WindowsOldMinDays) {
-            $handlers += "Previous Installations"
-            Set-StepNote "Windows.old ($age days old) included"
-        } else {
-            Set-StepNote "Windows.old kept (only $age days old, rollback still possible)"
-        }
+    $wo = @($UpgradeFolders | Where-Object { $_.Name -eq "Windows.old" })
+    if ($wo.Count -gt 0 -and $RemoveOldWindowsInstall -and $wo[0].AgeDays -ge $WindowsOldMinDays) {
+        $handlers += "Previous Installations"
+        Set-StepNote "Windows.old included"
     }
 
     if ($DryRun) { Set-StepNote "Dry run: Disk Cleanup not started"; $script:CleanMgrState = "Dry run"; return }
@@ -374,6 +448,23 @@ Invoke-CleanupStep "Windows Disk Cleanup" $RunDiskCleanupTool {
         Set-StepNote "Still running after $([int]$budget) min; more space will be freed when it finishes"
     }
 }
+
+# Removes whatever Disk Cleanup left behind (or everything, if Disk Cleanup did not run).
+Invoke-CleanupStep "Old Windows install (Windows.old)" ($UpgradeFolders.Count -gt 0) {
+    foreach ($f in $UpgradeFolders) {
+        if (-not (Test-Path -LiteralPath $f.Path)) { $f.Result = "Removed by Disk Cleanup"; continue }
+        if (-not $RemoveOldWindowsInstall) { $f.Result = "Kept (disabled in settings)"; continue }
+        if ($f.AgeDays -lt $WindowsOldMinDays) { $f.Result = "Kept ($($f.AgeDays) days old, rollback still possible)"; continue }
+        if ($SetupBusy) { $f.Result = "Skipped (Windows upgrade is running)"; continue }
+        if ($CleanMgrState -eq "Still running in background") { $f.Result = "Skipped (Disk Cleanup is still removing it)"; continue }
+        if ($DryRun) { $f.Result = "Would remove"; $script:StepBytes += $f.Size; continue }
+        if ((Get-MinutesLeft) -lt 8) { $f.Result = "Skipped (time budget); run again"; continue }
+        $f.Result = Remove-UpgradeFolder $f.Path
+        if ($f.Result -eq "Removed") { $script:StepBytes += $f.Size }
+    }
+    Set-StepNote "$($UpgradeFolders.Count) folder(s) checked"
+}
+if (-not $Proceed) { foreach ($f in $UpgradeFolders) { $f.Result = "Present (cleanup not run, above threshold)" } }
 
 # ---------------- Results ----------------
 $Disk = Get-DiskInfo
@@ -404,6 +495,11 @@ if ($PendingReboot.Count -gt 0) {
 }
 if ($Proceed -and $ServicingBusy) { Add-Finding "INFO" "Windows servicing (TiWorker) was running; update-related cleanup was limited. Run again later for more space." }
 if ($CleanMgrState -eq "Still running in background") { Add-Finding "INFO" "Disk Cleanup is still running. Re-check free space in 30-60 minutes." }
+foreach ($f in $UpgradeFolders) {
+    if ($Proceed -and -not $DryRun -and $f.Result -notmatch '^Removed') {
+        Add-Finding "INFO" "$($f.Path) ($(Format-Size $f.Size)) was not removed: $($f.Result)."
+    }
+}
 
 # ---------------- Deep report: where is the remaining space? ----------------
 $ProfileLines = @()
@@ -492,9 +588,19 @@ $Lines = @(
 "Files Removed : $FilesTotal ($(Format-Size $FoundTotal))",
 "Disk Cleanup Tool : $CleanMgrState",
 "",
-"Cleanup Steps",
-"-------------"
+"Old Windows Installation",
+"------------------------"
 )
+
+if ($UpgradeFolders.Count -eq 0) { $Lines += "None found." }
+foreach ($f in $UpgradeFolders) {
+    if ($Proceed) { $Lines += "$($f.Path) : $(Format-Size $f.Size), $($f.AgeDays) days old -> $($f.Result)" }
+    else { $Lines += "$($f.Path) : $($f.AgeDays) days old -> $($f.Result)" }
+}
+
+$Lines += ""
+$Lines += "Cleanup Steps"
+$Lines += "-------------"
 
 if (-not $Proceed) { $Lines += "Not run. Free space is above the threshold." }
 

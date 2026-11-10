@@ -34,6 +34,11 @@ Disk_Space_Cleanup_v2.0.ps1
 - NEW: Time budget ($MaxRuntimeMinutes, default 40). Disk Cleanup is shortened or skipped
   so the script always returns its output to ZDX.
 - NEW: Uses DISM component cleanup if cleanmgr is not available on the device.
+- NEW: Old Windows installation: measures Windows.old and upgrade leftovers
+  ($WINDOWS.~BT, $Windows.~WS, $GetCurrent) and shows their size. If Disk Cleanup did not
+  remove them, deletes them directly (links inside are removed first so nothing outside
+  the folder is touched). Kept if newer than $WindowsOldMinDays (default 10) or while a
+  Windows upgrade is running. Set $WindowsOldMinDays = 0 to always remove.
 - NEW: Reports a pending restart (a restart can free more space).
 - NEW: If still below 15% free, a deeper report lists (nothing is deleted):
     - 5 largest profiles, with Downloads and locally stored OneDrive size
