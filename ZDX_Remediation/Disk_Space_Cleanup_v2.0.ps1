@@ -32,12 +32,15 @@ $RestorePointMaxPercent    = 0       # 0 = leave System Restore alone; e.g. 5 = 
 $DeepReportWhenLow         = $true   # if still below 15% free, scan profiles and report where the space is
 $StaleProfileDays          = 90      # profiles unused this long are listed (never deleted)
 $BigFileGB                 = 1       # files this size or larger in user profiles are listed (never deleted)
-$WriteLocalLog             = $true   # also save the output to C:\ProgramData\ZDX\Logs on the device
+$WriteLocalLog             = $true   # also save the output to C:\ProgramData\ZDX_Remediation\Logs on the device
 # ------------------------------------------
 
 $StartTime = Get-Date
 $Drive = $env:SystemDrive
 if (-not $Drive) { $Drive = "C:" }
+# Never build cleanup paths from empty variables (they would point at the drive root).
+if (-not $env:SystemRoot) { $env:SystemRoot = "$Drive\Windows" }
+if (-not $env:ProgramData) { $env:ProgramData = "$Drive\ProgramData" }
 $Findings = @()
 $Steps = @()
 $script:StepBytes = 0
@@ -69,12 +72,7 @@ function Get-DiskInfo {
 function Get-FolderSize {
     param([string]$Path)
     if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return 0 }
-    try {
-        $s = (Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue |
-              Measure-Object Length -Sum).Sum
-        if ($s) { return [double]$s }
-    } catch {}
-    return 0
+    return Get-TreeSize $Path
 }
 
 function Set-StepNote {
@@ -82,11 +80,33 @@ function Set-StepNote {
     if ($script:StepNote) { $script:StepNote += "; " + $Note } else { $script:StepNote = $Note }
 }
 
+# True if the path itself is a junction/symlink (checks the link, not its target).
+function Test-IsLink {
+    param([string]$Path)
+    $a = ([IO.FileInfo]$Path).Attributes
+    return ([int]$a -ne -1 -and [bool]($a -band [IO.FileAttributes]::ReparsePoint))
+}
+
+# True if $Path, or any folder between $Root and $Path, is a link.
+function Test-LinkInPath {
+    param([string]$Path, [string]$Root)
+    $p = $Path
+    while ($p -and $p.Length -ge $Root.Length) {
+        if (Test-IsLink $p) { return $true }
+        $p = Split-Path $p -Parent
+    }
+    return $false
+}
+
 # Deletes files older than $Cutoff under $Path, then removes empty folders.
-# Skips junctions/symlinks so it never follows a link outside the target folder.
+# Never follows junctions/symlinks: a folder is re-checked right before it is read,
+# and $Root..$Path is checked too, so a link planted in a user-writable folder
+# (Temp, Recycle Bin, browser cache) cannot redirect deletion to system files.
 function Remove-OldItems {
-    param([string]$Path, [datetime]$Cutoff, [string[]]$Exclude = @())
+    param([string]$Path, [datetime]$Cutoff, [string[]]$Exclude = @(), [string]$Root = "")
     if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return }
+    if (-not $Root) { $Root = $Path }
+    if (Test-LinkInPath $Path $Root) { return }
     foreach ($item in @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)) {
         if ($Exclude -contains $item.Name) { continue }
         if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
@@ -94,9 +114,8 @@ function Remove-OldItems {
             $dirTime = $item.LastWriteTime
             Remove-OldItems -Path $item.FullName -Cutoff $Cutoff -Exclude $Exclude
             if (-not $DryRun -and $dirTime -lt $Cutoff) {
-                if (@(Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue).Count -eq 0) {
-                    Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue
-                }
+                # Fails safely if the folder is not empty; never deletes contents.
+                try { [IO.Directory]::Delete($item.FullName, $false) } catch {}
             }
         } elseif ($item.LastWriteTime -lt $Cutoff) {
             Remove-OneFile $item
@@ -229,21 +248,47 @@ function Remove-UpgradeFolder {
     $left = @(& $cmd /c "dir /AL /S /B `"$Path`"" 2>$null | Where-Object { $_ })
     if ($left.Count -gt 0) { return "Stopped: $($left.Count) link(s) inside could not be removed safely" }
 
-    # /D Y answers the takeown prompt on English Windows.
-    & "$env:SystemRoot\System32\takeown.exe" /F $Path /R /A /D Y 2>&1 | Out-Null
-    & "$env:SystemRoot\System32\icacls.exe" $Path /grant "*S-1-5-32-544:(OI)(CI)F" /T /C /Q 2>&1 | Out-Null
+    # Empty the folder with robocopy in backup mode (/B): deletes protected files without
+    # changing any owner or permission, and /XJ means it never follows a link.
+    $empty = Join-Path "$env:SystemRoot\Temp" ("ZDX_empty_" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $empty -Force | Out-Null
+    if (-not (Test-Path -LiteralPath $empty) -or @(Get-ChildItem -LiteralPath $empty -Force).Count -ne 0) {
+        return "Stopped: could not prepare an empty work folder"
+    }
+    & "$env:SystemRoot\System32\robocopy.exe" $empty $Path /MIR /B /XJ /R:0 /W:0 /NFL /NDL /NJH /NJS /NP 2>&1 | Out-Null
+    try { [IO.Directory]::Delete($empty, $false) } catch {}
     & $cmd /c "rd /s /q `"$Path`"" 2>&1 | Out-Null
 
     if (Test-Path -LiteralPath $Path) { return "Partly removed (some files locked; restart and run again)" }
     return "Removed"
 }
 
+# Writes the output to C:\ProgramData\ZDX_Remediation\Logs. The folders are locked to SYSTEM and
+# Administrators, and logging is skipped if a folder or the file is a link or was
+# created by someone else, so a user cannot redirect this SYSTEM write elsewhere.
 function Write-LocalLog {
     param([string]$Name, [string]$Text)
     try {
-        $dir = Join-Path $env:ProgramData "ZDX\Logs"
-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $trusted = @("S-1-5-18", "S-1-5-32-544")
+        $base = Join-Path $env:ProgramData "ZDX_Remediation"
+        $dir = Join-Path $base "Logs"
+        foreach ($d in @($base, $dir)) {
+            if (-not (Test-Path -LiteralPath $d)) {
+                New-Item -ItemType Directory -Path $d -Force | Out-Null
+                $acl = New-Object System.Security.AccessControl.DirectorySecurity
+                $acl.SetAccessRuleProtection($true, $false)
+                foreach ($sid in $trusted) {
+                    $id = New-Object System.Security.Principal.SecurityIdentifier($sid)
+                    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($id, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")))
+                }
+                Set-Acl -LiteralPath $d -AclObject $acl
+            }
+            if (Test-IsLink $d) { return $null }
+            $owner = (Get-Acl -LiteralPath $d).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+            if ($trusted -notcontains $owner) { return $null }
+        }
         $file = Join-Path $dir "$Name.log"
+        if ((Test-Path -LiteralPath $file) -and (Test-IsLink $file)) { return $null }
         if ((Test-Path -LiteralPath $file) -and (Get-Item -LiteralPath $file).Length -gt 2MB) {
             Move-Item -LiteralPath $file -Destination "$file.old" -Force
         }
@@ -304,11 +349,13 @@ Invoke-CleanupStep "Windows temp and error reports" $CleanSystemTemp {
 
 Invoke-CleanupStep "User temp files (all profiles)" $CleanUserTemp {
     foreach ($p in $Profiles) {
-        $l = Join-Path $p.LocalPath "AppData\Local"
-        Remove-OldItems "$l\Temp" $TempCutoff
-        Remove-OldItems "$l\Microsoft\Windows\INetCache" $TempCutoff
-        Remove-OldItems "$l\CrashDumps" $Now
-        Remove-OldItems "$l\Microsoft\Windows\WER" $Now
+        $r = $p.LocalPath
+        $l = Join-Path $r "AppData\Local"
+        Remove-OldItems "$l\Temp" $TempCutoff -Root $r
+        # Content.Outlook holds opened email attachments the user may still be editing.
+        Remove-OldItems "$l\Microsoft\Windows\INetCache" $TempCutoff @("Content.Outlook") -Root $r
+        Remove-OldItems "$l\CrashDumps" $Now -Root $r
+        Remove-OldItems "$l\Microsoft\Windows\WER" $Now -Root $r
     }
     Set-StepNote "$($Profiles.Count) profile(s)"
 }
@@ -325,14 +372,15 @@ Invoke-CleanupStep "Browser cache (Edge/Chrome)" $CleanBrowserCache {
             $root = Join-Path $p.LocalPath $b.Rel
             if (-not (Test-Path -LiteralPath $root)) { continue }
             if ($openSids -contains $p.SID) { $skipped++; continue }
-            Remove-OldItems "$root\ShaderCache" $Now
-            Remove-OldItems "$root\GrShaderCache" $Now
+            if (Test-LinkInPath $root $p.LocalPath) { continue }
+            Remove-OldItems "$root\ShaderCache" $Now -Root $p.LocalPath
+            Remove-OldItems "$root\GrShaderCache" $Now -Root $p.LocalPath
             $bProfiles = @(Get-ChildItem -LiteralPath $root -Directory -Force | Where-Object {
                 $_.Name -eq "Default" -or $_.Name -like "Profile *" -or $_.Name -eq "Guest Profile"
             })
             foreach ($bp in $bProfiles) {
                 foreach ($c in @("Cache","Code Cache","GPUCache")) {
-                    Remove-OldItems (Join-Path $bp.FullName $c) $Now
+                    Remove-OldItems (Join-Path $bp.FullName $c) $Now -Root $p.LocalPath
                 }
             }
         }
@@ -351,7 +399,7 @@ Invoke-CleanupStep "Recycle Bin (all users)" $CleanRecycleBin {
     $rb = "$Drive\`$Recycle.Bin"
     if (Test-Path -LiteralPath $rb) {
         foreach ($sidDir in @(Get-ChildItem -LiteralPath $rb -Directory -Force)) {
-            Remove-OldItems $sidDir.FullName $Now @("desktop.ini")
+            Remove-OldItems $sidDir.FullName $Now @("desktop.ini") -Root $rb
         }
     }
 }
@@ -513,6 +561,7 @@ if ($Proceed -and $PctAfter -lt 15 -and -not $DryRun) {
             Add-Finding "INFO" "Detailed space report skipped to stay inside the $MaxRuntimeMinutes minute time budget."
         } else {
             $RecallMask = 0x400000 -bor 0x1000   # cloud-only (not stored locally) / offline
+            $ReportCut = $false
             $BigBytes = $BigFileGB * 1GB
             $big = New-Object System.Collections.ArrayList
             $stats = @()
@@ -521,15 +570,30 @@ if ($Proceed -and $PctAfter -lt 15 -and -not $DryRun) {
                 $dl = Join-Path $root "Downloads"
                 $odRoots = @(Get-ChildItem -LiteralPath $root -Directory -Force | Where-Object { $_.Name -like "OneDrive*" } | ForEach-Object { $_.FullName })
                 $total = 0.0; $dlSize = 0.0; $odSize = 0.0
-                Get-ChildItem -LiteralPath $root -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object {
-                    if ([int]$_.Attributes -band $RecallMask) { return }   # cloud-only file, uses no local space
-                    $len = [double]$_.Length
-                    $total += $len
-                    $fp = $_.FullName
-                    if ($fp.StartsWith($dl + "\", [StringComparison]::OrdinalIgnoreCase)) { $dlSize += $len }
-                    foreach ($od in $odRoots) { if ($fp.StartsWith($od + "\", [StringComparison]::OrdinalIgnoreCase)) { $odSize += $len; break } }
-                    if ($len -ge $BigBytes) { [void]$big.Add([pscustomobject]@{ Path = $fp; Size = $len; Modified = $_.LastWriteTime }) }
+                # Read-only walk. Folder links are not followed; OneDrive files (which are
+                # reparse points) are counted only when stored locally.
+                $stack = New-Object System.Collections.Stack
+                $stack.Push($root)
+                while ($stack.Count -gt 0) {
+                    if ((Get-MinutesLeft) -lt 1) { $ReportCut = $true; break }
+                    $d = $stack.Pop()
+                    try { $entries = ([IO.DirectoryInfo]$d).GetFileSystemInfos() } catch { continue }
+                    foreach ($e in $entries) {
+                        $attr = [int]$e.Attributes
+                        if ($attr -band [int][IO.FileAttributes]::Directory) {
+                            if (-not ($attr -band [int][IO.FileAttributes]::ReparsePoint)) { $stack.Push($e.FullName) }
+                            continue
+                        }
+                        if ($attr -band $RecallMask) { continue }   # cloud-only file, uses no local space
+                        $len = [double]$e.Length
+                        $total += $len
+                        $fp = $e.FullName
+                        if ($fp.StartsWith($dl + "\", [StringComparison]::OrdinalIgnoreCase)) { $dlSize += $len }
+                        foreach ($od in $odRoots) { if ($fp.StartsWith($od + "\", [StringComparison]::OrdinalIgnoreCase)) { $odSize += $len; break } }
+                        if ($len -ge $BigBytes) { [void]$big.Add([pscustomobject]@{ Path = $fp; Size = $len; Modified = $e.LastWriteTime }) }
+                    }
                 }
+                if ($ReportCut) { break }
                 $lastUse = $null
                 if ($p.LastUseTime) { $lastUse = [datetime]$p.LastUseTime }
                 $stats += [pscustomobject]@{
@@ -551,6 +615,9 @@ if ($Proceed -and $PctAfter -lt 15 -and -not $DryRun) {
                 $StaleLines += "$($s.Path) : $(Format-Size $s.Total), last used $($s.LastUse.ToString('yyyy-MM-dd'))"
             }
 
+            if ($ReportCut) {
+                Add-Finding "INFO" "Detailed space report stopped early to stay inside the $MaxRuntimeMinutes minute time budget; results are partial."
+            }
             if ($OneDriveLines.Count -gt 0) {
                 Add-Finding "INFO" "Large OneDrive folders are stored locally. Ask the user to right-click the OneDrive folder and choose 'Free up space'."
             }

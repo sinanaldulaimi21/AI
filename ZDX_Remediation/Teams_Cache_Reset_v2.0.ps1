@@ -15,10 +15,12 @@ $RelaunchTeams   = $true    # reopen Teams for the user if it was running before
 $KeepBackups     = 1        # cache backups to keep per folder (older ones are deleted)
 $FixOutlookAddin = $true    # re-enable the Teams Meeting add-in in Outlook if it is disabled
 $EventDays       = 7        # look-back window for Teams crash/hang events
-$WriteLocalLog   = $true    # also save the output to C:\ProgramData\ZDX\Logs on the device
+$WriteLocalLog   = $true    # also save the output to C:\ProgramData\ZDX_Remediation\Logs on the device
 # ------------------------------------------
 
 $StartTime = Get-Date
+if (-not $env:SystemRoot) { $env:SystemRoot = "C:\Windows" }
+if (-not $env:ProgramData) { $env:ProgramData = "C:\ProgramData" }
 $Stamp = $StartTime.ToString("yyyyMMdd_HHmmss")
 $Findings = @()
 $Actions = @()
@@ -40,15 +42,30 @@ function Format-Size {
     return ("{0:N0} MB" -f ($Bytes / 1MB))
 }
 
+# True if the path itself is a junction/symlink (checks the link, not its target).
+function Test-IsLink {
+    param([string]$Path)
+    $a = ([IO.FileInfo]$Path).Attributes
+    return ([int]$a -ne -1 -and [bool]($a -band [IO.FileAttributes]::ReparsePoint))
+}
+
+# Read-only folder size that never follows junctions/symlinks.
 function Get-FolderSize {
     param([string]$Path)
-    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return 0 }
-    try {
-        $s = (Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue |
-              Measure-Object Length -Sum).Sum
-        if ($s) { return [double]$s }
-    } catch {}
-    return 0
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path) -or (Test-IsLink $Path)) { return 0 }
+    $total = 0.0
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($Path)
+    while ($stack.Count -gt 0) {
+        $d = $stack.Pop()
+        try { $entries = ([IO.DirectoryInfo]$d).GetFileSystemInfos() } catch { continue }
+        foreach ($e in $entries) {
+            if ($e.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+            if ($e.Attributes -band [IO.FileAttributes]::Directory) { $stack.Push($e.FullName) }
+            else { $total += [double]$e.Length }
+        }
+    }
+    return $total
 }
 
 function Get-InteractiveUser {
@@ -151,7 +168,14 @@ function Remove-OldBackups {
            Where-Object { $_.Name -like "$Prefix.bak_*" } | Sort-Object Name -Descending)
     if ($b.Count -le $KeepBackups) { return }
     foreach ($x in $b[$KeepBackups..($b.Count - 1)]) {
-        Remove-Item -LiteralPath $x.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        # The backup lives in the user's profile, so the user could have swapped in a link.
+        # A link is removed as a link only; a real folder is deleted with "rd /s", which
+        # removes links inside it without following them.
+        if (Test-IsLink $x.FullName) {
+            try { [IO.Directory]::Delete($x.FullName, $false) } catch {}
+        } else {
+            & "$env:SystemRoot\System32\cmd.exe" /c "rd /s /q `"$($x.FullName)`"" 2>&1 | Out-Null
+        }
         if (-not (Test-Path -LiteralPath $x.FullName)) { Add-Action "Removed old backup $($x.Name)" }
     }
 }
@@ -187,12 +211,32 @@ function Get-AddinKeys {
     return $keys
 }
 
+# Writes the output to C:\ProgramData\ZDX_Remediation\Logs. The folders are locked to SYSTEM and
+# Administrators, and logging is skipped if a folder or the file is a link or was
+# created by someone else, so a user cannot redirect this SYSTEM write elsewhere.
 function Write-LocalLog {
     param([string]$Name, [string]$Text)
     try {
-        $dir = Join-Path $env:ProgramData "ZDX\Logs"
-        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $trusted = @("S-1-5-18", "S-1-5-32-544")
+        $base = Join-Path $env:ProgramData "ZDX_Remediation"
+        $dir = Join-Path $base "Logs"
+        foreach ($d in @($base, $dir)) {
+            if (-not (Test-Path -LiteralPath $d)) {
+                New-Item -ItemType Directory -Path $d -Force | Out-Null
+                $acl = New-Object System.Security.AccessControl.DirectorySecurity
+                $acl.SetAccessRuleProtection($true, $false)
+                foreach ($sid in $trusted) {
+                    $id = New-Object System.Security.Principal.SecurityIdentifier($sid)
+                    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($id, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")))
+                }
+                Set-Acl -LiteralPath $d -AclObject $acl
+            }
+            if (Test-IsLink $d) { return $null }
+            $owner = (Get-Acl -LiteralPath $d).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+            if ($trusted -notcontains $owner) { return $null }
+        }
         $file = Join-Path $dir "$Name.log"
+        if ((Test-Path -LiteralPath $file) -and (Test-IsLink $file)) { return $null }
         if ((Test-Path -LiteralPath $file) -and (Get-Item -LiteralPath $file).Length -gt 2MB) {
             Move-Item -LiteralPath $file -Destination "$file.old" -Force
         }
@@ -370,11 +414,27 @@ if ($User -notin @("Unknown","No Interactive User") -and $Sid) {
         $AddinState = "Not registered"
         Add-Finding "INFO" "Teams Meeting add-in for Outlook is not registered. If the Teams Meeting button is missing, reinstall or repair Teams."
     } else {
-        $disabled = @($addinKeys | Where-Object { (Get-ItemProperty -LiteralPath $_).LoadBehavior -ne 3 })
+        # Respect company policy: "0" in a policy AddinList means always disabled.
+        $policyOff = $false
+        foreach ($pk in @(
+            "Registry::HKEY_USERS\$Sid\Software\Policies\Microsoft\Office\16.0\Outlook\Resiliency\AddinList",
+            "HKLM:\SOFTWARE\Policies\Microsoft\Office\16.0\Outlook\Resiliency\AddinList"
+        )) {
+            if ([string](Get-ItemProperty -LiteralPath $pk).$AddinProgId -eq "0") { $policyOff = $true }
+        }
+        # Only LoadBehavior 2 (turned off by Outlook or the user) is repaired. Any other
+        # non-3 value was set on purpose, so it is reported and left alone.
+        $disabled = @($addinKeys | Where-Object { (Get-ItemProperty -LiteralPath $_).LoadBehavior -eq 2 })
+        $custom = @($addinKeys | Where-Object { (Get-ItemProperty -LiteralPath $_).LoadBehavior -notin @(2,3) })
+        if ($custom.Count -gt 0) {
+            Add-Finding "INFO" "Teams Meeting add-in has a custom load setting on $($custom.Count) key(s); not changed."
+        }
         $resKey = "Registry::HKEY_USERS\$Sid\Software\Microsoft\Office\16.0\Outlook\Resiliency\DoNotDisableAddinList"
         $protected = ((Get-ItemProperty -LiteralPath $resKey).$AddinProgId -eq 1)
 
-        if ($disabled.Count -eq 0 -and $protected) {
+        if ($policyOff) {
+            $AddinState = "Disabled by company policy (not changed)"
+        } elseif ($disabled.Count -eq 0 -and $protected) {
             $AddinState = "Enabled"
         } elseif (-not $FixOutlookAddin -or $DryRun) {
             if ($disabled.Count -gt 0) { $AddinState = "Disabled (not fixed: dry run or setting off)" }
@@ -387,7 +447,7 @@ if ($User -notin @("Unknown","No Interactive User") -and $Sid) {
                 if (-not (Test-Path -LiteralPath $resKey)) { New-Item -Path $resKey -Force | Out-Null }
                 New-ItemProperty -LiteralPath $resKey -Name $AddinProgId -Value 1 -PropertyType DWord -Force | Out-Null
             }
-            $still = @($addinKeys | Where-Object { (Get-ItemProperty -LiteralPath $_).LoadBehavior -ne 3 })
+            $still = @($disabled | Where-Object { (Get-ItemProperty -LiteralPath $_).LoadBehavior -ne 3 })
             if ($still.Count -eq 0) {
                 $AddinState = "Repaired (takes effect when Outlook restarts)"
                 if ($disabled.Count -gt 0) { Add-Action "Re-enabled Teams Meeting add-in for Outlook ($($disabled.Count) key(s))" }

@@ -6,7 +6,7 @@ Both scripts:
 - Must be run with Elevated Permissions (System Account).
 - Have a Settings block at the top. Change settings BEFORE signing.
 - Set $DryRun = $true to test: the script reports what it would do and changes nothing.
-- Save a copy of every run's output on the device: C:\ProgramData\ZDX\Logs\<script>.log
+- Save a copy of every run's output on the device: C:\ProgramData\ZDX_Remediation\Logs\<script>.log (admin-only folder)
 - Must be signed after any edit. Do not edit after signing.
 - The signing certificate must be in Local Machine > Trusted Publishers on every device.
 
@@ -36,7 +36,8 @@ Disk_Space_Cleanup_v2.0.ps1
 - NEW: Uses DISM component cleanup if cleanmgr is not available on the device.
 - NEW: Old Windows installation: measures Windows.old and upgrade leftovers
   ($WINDOWS.~BT, $Windows.~WS, $GetCurrent) and shows their size. If Disk Cleanup did not
-  remove them, deletes them directly (links inside are removed first so nothing outside
+  remove them, deletes them directly with robocopy backup mode (no ownership or permission
+  changes; links inside are removed first and never followed, so nothing outside
   the folder is touched). Kept if newer than $WindowsOldMinDays (default 10) or while a
   Windows upgrade is running. Set $WindowsOldMinDays = 0 to always remove.
 - NEW: Reports a pending restart (a restart can free more space).
@@ -50,3 +51,13 @@ Disk_Space_Cleanup_v2.0.ps1
 
 Test first: run both with $DryRun = $true on a pilot device, then with $DryRun = $false.
 Check total run time against your ZDX script timeout and set $MaxRuntimeMinutes below it.
+
+Safety review (v2.0):
+- Every delete skips junctions/symlinks and re-checks each folder right before reading it,
+  so a link planted in Temp, Recycle Bin, browser cache or Teams backups cannot redirect
+  deletion to system files.
+- Outlook attachment temp folder (INetCache\Content.Outlook) is never cleaned.
+- Teams add-in: only re-enables an add-in turned off by Outlook/user (LoadBehavior 2).
+  Leaves it alone if company policy disables it or an admin set a custom value.
+- Log folder is locked to SYSTEM/Administrators and skipped if tampered with.
+- Windows.old removal never changes file ownership or permissions.
