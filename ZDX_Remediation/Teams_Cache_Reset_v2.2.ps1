@@ -1,5 +1,5 @@
 # ZDX Teams Cache Reset
-# Version 2.1 - REMEDIATION (makes changes) - ASCII
+# Version 2.2 - REMEDIATION (makes changes) - ASCII
 # Created by: Sinan Aldulaimi
 # Closes Teams for the logged-on user, renames the Teams cache folder
 # (a backup is kept), reopens Teams if it was running before, and repairs
@@ -7,7 +7,7 @@
 # Run with Elevated Permissions (System Account).
 
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "2.1"
+$Version = "2.2"
 
 # ---------------- Settings ----------------
 $DryRun          = $false   # $true = report only, change nothing
@@ -98,13 +98,27 @@ function Get-UserProfileInfo {
     return $null
 }
 
+# Finds the user's Teams processes. Uses CIM + GetOwner, which works whether or not
+# the script is elevated (Get-Process -IncludeUserName needs elevation and returned
+# nothing when run as a normal user, so Teams looked "not running").
 function Get-UserTeamsProcesses {
     param([string]$UserName)
-    $all = @(Get-Process -Name "ms-teams","Teams" -IncludeUserName -ErrorAction SilentlyContinue)
-    if ($all.Count -eq 0) { return @() }
-    $mine = @($all | Where-Object { $_.UserName -ieq $UserName })
-    # If owner names cannot be read at all, fall back to every Teams process.
-    if ($mine.Count -eq 0 -and @($all | Where-Object { $_.UserName }).Count -eq 0) { return $all }
+    $procs = @(Get-CimInstance Win32_Process -Filter "Name='ms-teams.exe' OR Name='Teams.exe'" -ErrorAction SilentlyContinue)
+    if ($procs.Count -eq 0) { return @() }
+    $list = @()
+    foreach ($p in $procs) {
+        $owner = ""
+        $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue
+        if ($o -and $o.User) { $owner = "$($o.Domain)\$($o.User)" }
+        $list += [pscustomobject]@{
+            Id = [int]$p.ProcessId
+            ProcessName = [IO.Path]::GetFileNameWithoutExtension([string]$p.Name)
+            Owner = $owner
+        }
+    }
+    $mine = @($list | Where-Object { $_.Owner -ieq $UserName })
+    # If no owner could be read at all, treat every Teams process as the user's.
+    if ($mine.Count -eq 0 -and @($list | Where-Object { $_.Owner }).Count -eq 0) { return $list }
     return $mine
 }
 
@@ -251,6 +265,7 @@ function Write-LocalLog {
 }
 
 # ---------------- Discovery ----------------
+$IsElevated = (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $Context = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $User = Get-InteractiveUser
 $ProfileInfo = Get-UserProfileInfo $User
@@ -272,6 +287,7 @@ if ($ProfilePath) {
 }
 try {
     $pkg = Get-AppxPackage -AllUsers -Name MSTeams | Sort-Object Version -Descending | Select-Object -First 1
+    if (-not $pkg) { $pkg = Get-AppxPackage -Name MSTeams | Sort-Object Version -Descending | Select-Object -First 1 }
     if ($pkg) {
         $NewTeamsVersion = [string]$pkg.Version
         $PackageStatus = [string]$pkg.Status
@@ -325,96 +341,114 @@ if ($User -in @("Unknown","No Interactive User")) {
     if ($NewCache) { $NewResult = "Skipped" }
     if ($ClassicCache) { $ClassicResult = "Skipped" }
     Add-Finding "WARNING" "Microphone/camera in use by: $($ActiveMicCam -join ', '). User appears to be in a call. Teams was not touched; run again later."
+} elseif (-not $IsElevated) {
+    $Status = "NOT RUN - NEEDS SYSTEM"
+    if ($NewCache) { $NewResult = "Not changed" }
+    if ($ClassicCache) { $ClassicResult = "Not changed" }
+    Add-Finding "FAIL" "Script is not running with elevated rights ($Context). Enable 'Run with Elevated Permissions (System Account)' in ZDX. Nothing was changed."
 } elseif ($DryRun) {
     $Status = "DRY RUN"
     if ($NewCache) { $NewResult = "Would rename (dry run)" }
     if ($ClassicCache) { $ClassicResult = "Would rename (dry run)" }
 } else {
+    # 1. Close the user's Teams and confirm it is really closed before anything else.
     if ($Before.Count -gt 0) {
         $Before | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
         Add-Action "Closed $($Before.Count) Teams process(es) for $User"
     }
-    if ($NewCache) {
-        $esc = [regex]::Escape($NewCache)
-        $wv = @(Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" | Where-Object { $_.CommandLine -match $esc })
-        if ($wv.Count -gt 0) {
-            $wv | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-            Add-Action "Closed $($wv.Count) Teams WebView2 process(es)"
-        }
-    }
+    $closed = $false
     for ($i = 0; $i -lt 15; $i++) {
-        if (@(Get-UserTeamsProcesses $User).Count -eq 0) { break }
+        if (@(Get-UserTeamsProcesses $User).Count -eq 0) { $closed = $true; break }
         Start-Sleep -Seconds 1
     }
-
-    $ok = 0
-    $fail = 0
-    if ($NewCache) {
-        $name = "MSTeams.bak_$Stamp"
-        if (Rename-WithRetry $NewCache $name) {
-            $NewResult = "Renamed to $name"; $ok++
-            Add-Action "New Teams cache renamed to $name ($(Format-Size $NewCacheSize))"
-            Remove-OldBackups (Split-Path $NewCache -Parent) "MSTeams"
-        } else {
-            $NewResult = "FAILED (files in use)"; $fail++
-            Add-Finding "WARNING" "New Teams cache could not be renamed. Files are still in use."
-        }
-    }
-    if ($ClassicCache) {
-        $name = "Teams.bak_$Stamp"
-        if (Rename-WithRetry $ClassicCache $name) {
-            $ClassicResult = "Renamed to $name"; $ok++
-            Add-Action "Classic Teams cache renamed to $name ($(Format-Size $ClassicCacheSize))"
-            Remove-OldBackups (Split-Path $ClassicCache -Parent) "Teams"
-        } else {
-            $ClassicResult = "FAILED (files in use)"; $fail++
-            Add-Finding "WARNING" "Classic Teams cache could not be renamed. Files are still in use."
-        }
-    }
-
-    if ($fail -eq 0) { $Status = "RESET COMPLETE" }
-    elseif ($ok -gt 0) { $Status = "PARTIAL" }
-    else { $Status = "FAILED" }
-
-    if ($RelaunchTeams -and ($NewWasRunning -or $ClassicWasRunning)) {
-        $started = $false
-        if ($NewWasRunning) {
-            $started = Start-AppForUser $User "explorer.exe" "shell:AppsFolder\MSTeams_8wekyb3d8bbwe!MSTeams"
-        } elseif ($ClassicWasRunning) {
-            $upd = Join-Path $ProfilePath "AppData\Local\Microsoft\Teams\Update.exe"
-            if (Test-Path -LiteralPath $upd) { $started = Start-AppForUser $User $upd '--processStart "Teams.exe"' }
-        }
-        $running = $false
-        for ($i = 0; $i -lt 10; $i++) {
-            if (@(Get-UserTeamsProcesses $User).Count -gt 0) { $running = $true; break }
-            Start-Sleep -Seconds 2
-        }
-        if ($running) {
-            $Relaunch = "Teams reopened for the user"
-            Add-Action "Teams reopened for $User"
-            if ($NewCache) {
-                for ($i = 0; $i -lt 10; $i++) {
-                    if (Test-Path -LiteralPath $NewCache) { break }
-                    Start-Sleep -Seconds 2
-                }
-                if (Test-Path -LiteralPath $NewCache) { $CacheRebuilt = "Yes" } else { $CacheRebuilt = "Not yet (Teams still starting)" }
-            }
-        } else {
-            $Relaunch = "Could not confirm. Ask the user to open Teams."
-            Add-Finding "INFO" "Teams relaunch could not be confirmed (task started: $started). Ask the user to open Teams."
-        }
-    } elseif ($NewWasRunning -or $ClassicWasRunning) {
-        $Relaunch = "Disabled in settings. Ask the user to open Teams."
+    if (-not $closed) {
+        $Status = "FAILED"
+        if ($NewCache) { $NewResult = "Not changed (Teams could not be closed)" }
+        if ($ClassicCache) { $ClassicResult = "Not changed (Teams could not be closed)" }
+        Add-Finding "WARNING" "Teams could not be closed, so nothing else was changed. Ask the user to quit Teams and run again."
     } else {
-        $Relaunch = "Teams was not running, so it was not reopened"
-    }
+        # 2. Teams is closed: now close WebView2 helpers it left behind (they lock the cache).
+        if ($NewCache) {
+            $esc = [regex]::Escape($NewCache)
+            $wv = @(Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" | Where-Object { $_.CommandLine -match $esc })
+            if ($wv.Count -gt 0) {
+                $wv | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+                Add-Action "Closed $($wv.Count) leftover Teams WebView2 process(es)"
+                Start-Sleep -Seconds 2
+            }
+        }
 
-    Add-Finding "INFO" "The user may need to sign in to Teams again. The first launch after a reset can be slower."
+        $ok = 0
+        $fail = 0
+        if ($NewCache) {
+            $name = "MSTeams.bak_$Stamp"
+            if (Rename-WithRetry $NewCache $name) {
+                $NewResult = "Renamed to $name"; $ok++
+                Add-Action "New Teams cache renamed to $name ($(Format-Size $NewCacheSize))"
+                Remove-OldBackups (Split-Path $NewCache -Parent) "MSTeams"
+            } else {
+                $NewResult = "FAILED (files in use)"; $fail++
+                Add-Finding "WARNING" "New Teams cache could not be renamed. Files are still in use."
+            }
+        }
+        if ($ClassicCache) {
+            $name = "Teams.bak_$Stamp"
+            if (Rename-WithRetry $ClassicCache $name) {
+                $ClassicResult = "Renamed to $name"; $ok++
+                Add-Action "Classic Teams cache renamed to $name ($(Format-Size $ClassicCacheSize))"
+                Remove-OldBackups (Split-Path $ClassicCache -Parent) "Teams"
+            } else {
+                $ClassicResult = "FAILED (files in use)"; $fail++
+                Add-Finding "WARNING" "Classic Teams cache could not be renamed. Files are still in use."
+            }
+        }
+
+        if ($fail -eq 0) { $Status = "RESET COMPLETE" }
+        elseif ($ok -gt 0) { $Status = "PARTIAL" }
+        else { $Status = "FAILED" }
+
+        if ($RelaunchTeams -and ($NewWasRunning -or $ClassicWasRunning)) {
+            $started = $false
+            if ($NewWasRunning) {
+                $started = Start-AppForUser $User "explorer.exe" "shell:AppsFolder\MSTeams_8wekyb3d8bbwe!MSTeams"
+            } elseif ($ClassicWasRunning) {
+                $upd = Join-Path $ProfilePath "AppData\Local\Microsoft\Teams\Update.exe"
+                if (Test-Path -LiteralPath $upd) { $started = Start-AppForUser $User $upd '--processStart "Teams.exe"' }
+            }
+            $running = $false
+            for ($i = 0; $i -lt 10; $i++) {
+                if (@(Get-UserTeamsProcesses $User).Count -gt 0) { $running = $true; break }
+                Start-Sleep -Seconds 2
+            }
+            if ($running) {
+                $Relaunch = "Teams reopened for the user"
+                Add-Action "Teams reopened for $User"
+                if ($NewCache) {
+                    for ($i = 0; $i -lt 10; $i++) {
+                        if (Test-Path -LiteralPath $NewCache) { break }
+                        Start-Sleep -Seconds 2
+                    }
+                    if (Test-Path -LiteralPath $NewCache) { $CacheRebuilt = "Yes" } else { $CacheRebuilt = "Not yet (Teams still starting)" }
+                }
+            } else {
+                $Relaunch = "Could not confirm. Ask the user to open Teams."
+                Add-Finding "INFO" "Teams relaunch could not be confirmed (task started: $started). Ask the user to open Teams."
+            }
+        } elseif ($NewWasRunning -or $ClassicWasRunning) {
+            $Relaunch = "Disabled in settings. Ask the user to open Teams."
+        } else {
+            $Relaunch = "Teams was not running, so it was not reopened"
+        }
+
+        Add-Finding "INFO" "The user may need to sign in to Teams again. The first launch after a reset can be slower."
+    }
 }
 
 # ---------------- Outlook Teams Meeting add-in ----------------
 $AddinState = "Not checked"
-if ($User -notin @("Unknown","No Interactive User") -and $Sid) {
+if (-not $IsElevated) {
+    $AddinState = "Not checked (needs elevated rights)"
+} elseif ($User -notin @("Unknown","No Interactive User") -and $Sid) {
     $addinKeys = @(Get-AddinKeys $Sid)
     if ($addinKeys.Count -eq 0) {
         $AddinState = "Not registered"
