@@ -1,5 +1,5 @@
 # ZDX Teams Cache Reset
-# Version 2.0 - REMEDIATION (makes changes) - ASCII
+# Version 2.1 - REMEDIATION (makes changes) - ASCII
 # Created by: Sinan Aldulaimi
 # Closes Teams for the logged-on user, renames the Teams cache folder
 # (a backup is kept), reopens Teams if it was running before, and repairs
@@ -7,11 +7,11 @@
 # Run with Elevated Permissions (System Account).
 
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "2.0"
+$Version = "2.1"
 
 # ---------------- Settings ----------------
 $DryRun          = $false   # $true = report only, change nothing
-$SkipIfInCall    = $true    # do nothing to Teams if it is using the mic/camera (user in a call)
+$SkipIfInCall    = $true    # do nothing to Teams if ANY app is using the mic/camera (user in a call)
 $RelaunchTeams   = $true    # reopen Teams for the user if it was running before the reset
 $KeepBackups     = 1        # cache backups to keep per folder (older ones are deleted)
 $FixOutlookAddin = $true    # re-enable the Teams Meeting add-in in Outlook if it is disabled
@@ -108,24 +108,28 @@ function Get-UserTeamsProcesses {
     return $mine
 }
 
-function Test-TeamsInCall {
+# Returns the apps that are using the microphone or camera right now, based on the
+# user's Windows privacy usage records (packaged and desktop apps, any name).
+# New Teams can run call audio through helper processes (e.g. WebView2 or a media
+# host) that are not recorded under the Teams name, so ANY active mic/camera use
+# counts as "in a call". This errs on the side of not interrupting the user.
+function Get-ActiveMicCamApps {
     param([string]$Sid)
-    if (-not $Sid) { return $false }
+    $apps = @()
+    if (-not $Sid) { return $apps }
     $base = "Registry::HKEY_USERS\$Sid\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore"
     foreach ($cap in @("microphone","webcam")) {
-        $keys = @()
-        $pkgKey = "$base\$cap\MSTeams_8wekyb3d8bbwe"
-        if (Test-Path -LiteralPath $pkgKey) { $keys += $pkgKey }
-        $npKey = "$base\$cap\NonPackaged"
-        if (Test-Path -LiteralPath $npKey) {
-            $keys += @(Get-ChildItem -LiteralPath $npKey | Where-Object { $_.PSChildName -match 'Teams\.exe$' } | ForEach-Object { $_.PSPath })
-        }
-        foreach ($k in $keys) {
-            $v = Get-ItemProperty -LiteralPath $k
-            if ($v -and $v.LastUsedTimeStart -gt 0 -and $v.LastUsedTimeStop -eq 0) { return $true }
+        $capKey = "$base\$cap"
+        if (-not (Test-Path -LiteralPath $capKey)) { continue }
+        foreach ($k in @(Get-ChildItem -LiteralPath $capKey -Recurse -ErrorAction SilentlyContinue)) {
+            $v = Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue
+            if ($v -and $v.LastUsedTimeStart -gt 0 -and $v.LastUsedTimeStop -eq 0) {
+                $name = ($k.PSChildName -split '#')[-1]   # desktop apps are stored as C:#path#app.exe
+                $apps += "$name ($cap)"
+            }
         }
     }
-    return $false
+    return @($apps | Select-Object -Unique)
 }
 
 function Get-TeamsEvents {
@@ -287,7 +291,8 @@ $ClassicCacheSize = Get-FolderSize $ClassicCache
 $Before = @(Get-UserTeamsProcesses $User)
 $NewWasRunning = @($Before | Where-Object { $_.ProcessName -ieq "ms-teams" }).Count -gt 0
 $ClassicWasRunning = @($Before | Where-Object { $_.ProcessName -ieq "Teams" }).Count -gt 0
-$InCall = Test-TeamsInCall $Sid
+$ActiveMicCam = @(Get-ActiveMicCamApps $Sid)
+$InCall = ($ActiveMicCam.Count -gt 0)
 
 # Health findings (informational, independent of the reset)
 if ($WebView2 -eq "Not Detected" -and $NewTeamsVersion -ne "Not Detected") {
@@ -319,7 +324,7 @@ if ($User -in @("Unknown","No Interactive User")) {
     $Status = "SKIPPED - USER IN CALL"
     if ($NewCache) { $NewResult = "Skipped" }
     if ($ClassicCache) { $ClassicResult = "Skipped" }
-    Add-Finding "WARNING" "Teams is using the microphone or camera. User appears to be in a call. Run again later."
+    Add-Finding "WARNING" "Microphone/camera in use by: $($ActiveMicCam -join ', '). User appears to be in a call. Teams was not touched; run again later."
 } elseif ($DryRun) {
     $Status = "DRY RUN"
     if ($NewCache) { $NewResult = "Would rename (dry run)" }
@@ -492,7 +497,8 @@ $Lines = @(
 "Classic Teams Found : $ClassicDetected",
 "Classic Teams Running : $(if($ClassicWasRunning){'Yes'}else{'No'})",
 "Classic Teams Cache : $(if($ClassicCache){Format-Size $ClassicCacheSize}else{'Not found'})",
-"Teams In Call : $(if($InCall){'Yes'}else{'No'})",
+"User In Call : $(if($InCall){'Yes'}else{'No'})",
+"Mic/Camera In Use By : $(if($InCall){$ActiveMicCam -join ', '}else{'None'})",
 "",
 "Result",
 "------",

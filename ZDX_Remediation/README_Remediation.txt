@@ -10,9 +10,10 @@ Both scripts:
 - Must be signed after any edit. Do not edit after signing.
 - The signing certificate must be in Local Machine > Trusted Publishers on every device.
 
-Teams_Cache_Reset_v2.0.ps1
+Teams_Cache_Reset_v2.1.ps1
 - Finds the logged-on user and their Teams cache (new Teams and classic Teams).
-- Does nothing to Teams if the user is in a Teams call (mic/camera in use).
+- Does nothing to Teams if ANY app is using the mic or camera (user in a call); the
+  output names the app(s) found. (v2.1 fix: v2.0 only checked the Teams app name.)
 - Closes Teams for that user only, renames the cache to MSTeams.bak_<date> (backup kept),
   deletes older backups, reopens Teams if it was open, and confirms the cache was rebuilt.
 - NEW: Repairs the Outlook "Teams Meeting" add-in (re-enables it and stops Outlook from
