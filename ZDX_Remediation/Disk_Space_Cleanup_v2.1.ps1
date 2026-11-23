@@ -1,20 +1,23 @@
 # ZDX Disk Space Cleanup (System Drive)
-# Version 2.0 - REMEDIATION (makes changes) - ASCII
+# Version 2.1 - REMEDIATION (makes changes) - ASCII
 # Created by: Sinan Aldulaimi
 # Frees as much space as safely possible on the system drive (C:).
 # Runs only when free space is at or below $RunIfFreeAtOrBelowGB.
 # Never touches user documents, Desktop, Downloads, cookies, passwords or history.
 # If space is still low afterwards, reports where the space went (big files,
 # old profiles, OneDrive files stored locally) so the technician knows what to ask.
+# Designed to finish inside the ZDX script time limit (~5 min): fast cleanup runs
+# first, and the slow Windows Disk Cleanup (incl. Windows.old) is handed to a
+# one-time background task that keeps running after the script returns.
 # Run with Elevated Permissions (System Account).
 
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "2.0"
+$Version = "2.1"
 
 # ---------------- Settings ----------------
 $DryRun                    = $false  # $true = measure only, delete nothing
 $RunIfFreeAtOrBelowGB      = 20      # clean only if C: free space is this many GB or less (0 = always run)
-$MaxRuntimeMinutes         = 40      # total time budget; slow steps are shortened or skipped to stay under it
+$MaxRuntimeMinutes         = 4       # ZDX stops scripts after ~5-6 min; every step checks this budget
 $TempFileAgeHours          = 24      # temp files newer than this are kept (protects running installs)
 $CleanSystemTemp           = $true   # Windows\Temp, WER reports, old CBS logs
 $CleanUserTemp             = $true   # every profile: Temp, INetCache, CrashDumps, WER
@@ -24,10 +27,9 @@ $CleanCrashDumps           = $true   # MEMORY.DMP, LiveKernelReports, minidumps 
 $MinidumpAgeDays           = 30
 $CleanWindowsUpdateCache   = $true   # SoftwareDistribution\Download
 $CleanDeliveryOptimization = $true   # Delivery Optimization cache
-$RunDiskCleanupTool        = $true   # cleanmgr (or DISM component cleanup if cleanmgr is missing)
+$RunDiskCleanupTool        = $true   # start Windows Disk Cleanup as a background task (incl. Windows.old)
 $RemoveOldWindowsInstall   = $true   # Windows.old + upgrade leftovers, only if older than $WindowsOldMinDays (removes rollback)
 $WindowsOldMinDays         = 10      # 0 = remove even right after an upgrade
-$DiskCleanupTimeoutMinutes = 25      # if cleanmgr runs longer, it keeps running in the background
 $DisableHibernation        = $false  # frees hiberfil.sys but turns off hibernate and Fast Startup
 $RestorePointMaxPercent    = 0       # 0 = leave System Restore alone; e.g. 5 = cap restore points at 5% of C:
 $DeepReportWhenLow         = $true   # if still below 15% free, scan profiles and report where the space is
@@ -109,6 +111,7 @@ function Remove-OldItems {
     if (-not $Root) { $Root = $Path }
     if (Test-LinkInPath $Path $Root) { return }
     foreach ($item in @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)) {
+        if ((Get-MinutesLeft) -lt 0.5) { $script:TimeCut = $true; return }
         if ($Exclude -contains $item.Name) { continue }
         if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
         if ($item.PSIsContainer) {
@@ -144,6 +147,11 @@ function Remove-MatchingFiles {
 function Invoke-CleanupStep {
     param([string]$Name, [bool]$Enabled, [scriptblock]$Action)
     if (-not $Proceed) { return }
+    if ($Enabled -and (Get-MinutesLeft) -lt 0.75) {
+        $script:Steps += [pscustomobject]@{ Name = $Name; Freed = 0; Found = 0; Files = 0; Seconds = 0; Note = "Skipped (time budget); run again" }
+        $script:TimeCut = $true
+        return
+    }
     if (-not $Enabled) {
         $script:Steps += [pscustomobject]@{ Name = $Name; Freed = 0; Found = 0; Files = 0; Seconds = 0; Note = "Disabled in settings" }
         return
@@ -162,6 +170,10 @@ function Invoke-CleanupStep {
         Files   = $script:StepFiles
         Seconds = [int]((Get-Date) - $t).TotalSeconds
         Note    = $script:StepNote
+    }
+    if ($WriteLocalLog) {
+        $last = $script:Steps[-1]
+        [void](Write-LocalLog "Disk_Space_Cleanup_progress" ("{0}  {1}: freed {2} in {3}s {4}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Name, (Format-Size $last.Freed), $last.Seconds, $last.Note))
     }
 }
 
@@ -313,6 +325,12 @@ $PendingReboot = @(Get-PendingReboot)
 if ($RunIfFreeAtOrBelowGB -le 0) { $ThresholdText = "Always run" }
 else { $ThresholdText = "$RunIfFreeAtOrBelowGB GB free or less" }
 $Proceed = ($RunIfFreeAtOrBelowGB -le 0) -or ($FreeBefore -le ($RunIfFreeAtOrBelowGB * 1GB))
+$IsElevated = (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$NotElevated = -not $IsElevated
+if ($NotElevated) { $Proceed = $false }
+$script:TimeCut = $false
+$script:WinOldInBackground = $false
+if ($WriteLocalLog -and $Proceed) { [void](Write-LocalLog "Disk_Space_Cleanup_progress" ("{0}  Run started (free {1})" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), (Format-Size $FreeBefore))) }
 
 # Old Windows installation and upgrade leftovers
 $SetupBusy = [bool](Get-Process -Name SetupHost,SetupPrep -ErrorAction SilentlyContinue)
@@ -323,8 +341,7 @@ foreach ($name in @("Windows.old", "`$WINDOWS.~BT", "`$Windows.~WS", "`$GetCurre
     $gi = Get-Item -LiteralPath $path -Force
     $newest = $gi.CreationTime
     if ($gi.LastWriteTime -gt $newest) { $newest = $gi.LastWriteTime }
-    $size = 0
-    if ($Proceed) { $size = Get-TreeSize $path }
+    $size = 0   # not measured up front: sizing Windows.old can take minutes
     $UpgradeFolders += [pscustomobject]@{
         Name = $name; Path = $path; AgeDays = [int]((Get-Date) - $newest).TotalDays
         Size = $size; Result = "Pending"
@@ -332,6 +349,46 @@ foreach ($name in @("Windows.old", "`$WINDOWS.~BT", "`$Windows.~WS", "`$GetCurre
 }
 
 # ---------------- Cleanup steps (fast first, slow last) ----------------
+
+$CleanMgrState = "Not run"
+Invoke-CleanupStep "Recycle Bin (all users)" $CleanRecycleBin {
+    $rb = "$Drive\`$Recycle.Bin"
+    if (Test-Path -LiteralPath $rb) {
+        foreach ($sidDir in @(Get-ChildItem -LiteralPath $rb -Directory -Force)) {
+            Remove-OldItems $sidDir.FullName $Now @("desktop.ini") -Root $rb
+        }
+    }
+}
+
+Invoke-CleanupStep "Crash dump files" $CleanCrashDumps {
+    $md = "$env:SystemRoot\MEMORY.DMP"
+    if (Test-Path -LiteralPath $md) { Remove-OneFile (Get-Item -LiteralPath $md -Force) }
+    Remove-OldItems "$env:SystemRoot\LiveKernelReports" $Now
+    Remove-OldItems "$env:SystemRoot\Minidump" (Get-Date).AddDays(-$MinidumpAgeDays)
+}
+
+Invoke-CleanupStep "Windows Update download cache" $CleanWindowsUpdateCache {
+    if ($ServicingBusy) { Set-StepNote "Skipped (Windows servicing busy, update may be installing)"; return }
+    $dl = "$env:SystemRoot\SoftwareDistribution\Download"
+    if ($DryRun) { Remove-OldItems $dl $Now; return }
+    $svcs = @("wuauserv","bits")
+    $wasRunning = @($svcs | Where-Object { (Get-Service $_).Status -eq "Running" })
+    Stop-Service -Name $svcs -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+    Remove-OldItems $dl $Now
+    foreach ($s in $wasRunning) { Start-Service -Name $s -ErrorAction SilentlyContinue }
+}
+
+Invoke-CleanupStep "Delivery Optimization cache" $CleanDeliveryOptimization {
+    $doPath = "$env:SystemRoot\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache"
+    $script:StepBytes = Get-FolderSize $doPath
+    if ($DryRun) { return }
+    if (Get-Command Delete-DeliveryOptimizationCache -ErrorAction SilentlyContinue) {
+        Delete-DeliveryOptimizationCache -Force -ErrorAction SilentlyContinue | Out-Null
+    } else {
+        Set-StepNote "Delivery Optimization cmdlet not available"
+    }
+}
 
 Invoke-CleanupStep "Windows temp and error reports" $CleanSystemTemp {
     Remove-OldItems "$env:SystemRoot\Temp" $TempCutoff
@@ -389,45 +446,6 @@ Invoke-CleanupStep "Browser cache (Edge/Chrome)" $CleanBrowserCache {
     if ($skipped -gt 0) { Set-StepNote "$skipped browser profile(s) skipped (browser open)" }
 }
 
-Invoke-CleanupStep "Crash dump files" $CleanCrashDumps {
-    $md = "$env:SystemRoot\MEMORY.DMP"
-    if (Test-Path -LiteralPath $md) { Remove-OneFile (Get-Item -LiteralPath $md -Force) }
-    Remove-OldItems "$env:SystemRoot\LiveKernelReports" $Now
-    Remove-OldItems "$env:SystemRoot\Minidump" (Get-Date).AddDays(-$MinidumpAgeDays)
-}
-
-Invoke-CleanupStep "Recycle Bin (all users)" $CleanRecycleBin {
-    $rb = "$Drive\`$Recycle.Bin"
-    if (Test-Path -LiteralPath $rb) {
-        foreach ($sidDir in @(Get-ChildItem -LiteralPath $rb -Directory -Force)) {
-            Remove-OldItems $sidDir.FullName $Now @("desktop.ini") -Root $rb
-        }
-    }
-}
-
-Invoke-CleanupStep "Windows Update download cache" $CleanWindowsUpdateCache {
-    if ($ServicingBusy) { Set-StepNote "Skipped (Windows servicing busy, update may be installing)"; return }
-    $dl = "$env:SystemRoot\SoftwareDistribution\Download"
-    if ($DryRun) { Remove-OldItems $dl $Now; return }
-    $svcs = @("wuauserv","bits")
-    $wasRunning = @($svcs | Where-Object { (Get-Service $_).Status -eq "Running" })
-    Stop-Service -Name $svcs -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 3
-    Remove-OldItems $dl $Now
-    foreach ($s in $wasRunning) { Start-Service -Name $s -ErrorAction SilentlyContinue }
-}
-
-Invoke-CleanupStep "Delivery Optimization cache" $CleanDeliveryOptimization {
-    $doPath = "$env:SystemRoot\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache"
-    $script:StepBytes = Get-FolderSize $doPath
-    if ($DryRun) { return }
-    if (Get-Command Delete-DeliveryOptimizationCache -ErrorAction SilentlyContinue) {
-        Delete-DeliveryOptimizationCache -Force -ErrorAction SilentlyContinue | Out-Null
-    } else {
-        Set-StepNote "Delivery Optimization cmdlet not available"
-    }
-}
-
 Invoke-CleanupStep "Hibernation file" $DisableHibernation {
     $hf = "$Drive\hiberfil.sys"
     if (-not (Test-Path -LiteralPath $hf)) { Set-StepNote "Hibernation already off"; return }
@@ -444,76 +462,83 @@ Invoke-CleanupStep "System Restore storage cap" ($RestorePointMaxPercent -gt 0) 
     else { Set-StepNote "vssadmin did not confirm the change" }
 }
 
-$CleanMgrState = "Not run"
-Invoke-CleanupStep "Windows Disk Cleanup" $RunDiskCleanupTool {
-    $budget = [Math]::Min($DiskCleanupTimeoutMinutes, (Get-MinutesLeft) - 3)
-    if ($budget -lt 2) {
-        Set-StepNote "Skipped (time budget of $MaxRuntimeMinutes min nearly used)"
-        $script:CleanMgrState = "Skipped (time budget)"
+
+Invoke-CleanupStep "Windows Disk Cleanup (background)" $RunDiskCleanupTool {
+    # Runs as a one-time SYSTEM scheduled task so it keeps going after ZDX ends this script.
+    $taskName = "ZDX_DiskCleanup_Background"
+    $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($existing -and [string]$existing.State -eq "Running") {
+        $script:CleanMgrState = "Already running in background (started earlier)"
+        $script:WinOldInBackground = $true
+        Set-StepNote "Started by an earlier run and still working"
         return
     }
 
     $exe = "$env:SystemRoot\System32\cleanmgr.exe"
+    $args2 = "/sagerun:777"
     if (-not (Test-Path -LiteralPath $exe)) {
         # Fallback for builds without cleanmgr: component store cleanup only.
-        if ($DryRun) { $script:CleanMgrState = "Dry run (DISM fallback)"; return }
-        $dism = "$env:SystemRoot\System32\Dism.exe"
-        $script:CleanMgrState = "DISM: " + (Start-WithTimeout $dism "/Online /Cleanup-Image /StartComponentCleanup /Quiet" $budget)
-        Set-StepNote "cleanmgr not found; used DISM component cleanup"
-        return
-    }
-
-    $vc = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches"
-    $flag = "StateFlags0777"
-    $handlers = @(
-        "Update Cleanup", "Windows Upgrade Log Files", "Upgrade Discarded Files",
-        "Temporary Setup Files", "Setup Log Files", "Device Driver Packages",
-        "Downloaded Program Files", "Temporary Files", "Windows Error Reporting Files",
-        "Delivery Optimization Files", "D3D Shader Cache", "Old ChkDsk Files",
-        "Thumbnail Cache", "Internet Cache Files", "Feedback Hub Archive log files",
-        "Diagnostic Data Viewer database files", "RetailDemo Offline Content", "BranchCache"
-    )
-    if ($CleanCrashDumps) { $handlers += "System error memory dump files" }
-
-    $wo = @($UpgradeFolders | Where-Object { $_.Name -eq "Windows.old" })
-    if ($wo.Count -gt 0 -and $RemoveOldWindowsInstall -and $wo[0].AgeDays -ge $WindowsOldMinDays) {
-        $handlers += "Previous Installations"
-        Set-StepNote "Windows.old included"
-    }
-
-    if ($DryRun) { Set-StepNote "Dry run: Disk Cleanup not started"; $script:CleanMgrState = "Dry run"; return }
-
-    # Clear any old selection under this ID, then select only our handlers.
-    Get-ChildItem -LiteralPath $vc | ForEach-Object { Remove-ItemProperty -LiteralPath $_.PSPath -Name $flag -ErrorAction SilentlyContinue }
-    foreach ($h in $handlers) {
-        $k = Join-Path $vc $h
-        if (Test-Path -LiteralPath $k) { New-ItemProperty -LiteralPath $k -Name $flag -Value 2 -PropertyType DWord -Force | Out-Null }
-    }
-
-    $script:CleanMgrState = Start-WithTimeout $exe "/sagerun:777" $budget
-    if ($script:CleanMgrState -eq "Completed") {
+        $exe = "$env:SystemRoot\System32\Dism.exe"
+        $args2 = "/Online /Cleanup-Image /StartComponentCleanup /Quiet"
+        Set-StepNote "cleanmgr not found; using DISM component cleanup"
+    } else {
+        $vc = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches"
+        $flag = "StateFlags0777"
+        $handlers = @(
+            "Update Cleanup", "Windows Upgrade Log Files", "Upgrade Discarded Files",
+            "Temporary Setup Files", "Setup Log Files", "Device Driver Packages",
+            "Downloaded Program Files", "Temporary Files", "Windows Error Reporting Files",
+            "Delivery Optimization Files", "D3D Shader Cache", "Old ChkDsk Files",
+            "Thumbnail Cache", "Internet Cache Files", "Feedback Hub Archive log files",
+            "Diagnostic Data Viewer database files", "RetailDemo Offline Content", "BranchCache"
+        )
+        if ($CleanCrashDumps) { $handlers += "System error memory dump files" }
+        $wo = @($UpgradeFolders | Where-Object { $_.Name -eq "Windows.old" })
+        $woIncluded = ($wo.Count -gt 0 -and $RemoveOldWindowsInstall -and $wo[0].AgeDays -ge $WindowsOldMinDays -and -not $SetupBusy)
+        if ($woIncluded) { $handlers += "Previous Installations"; Set-StepNote "Windows.old included" }
+        if ($DryRun) { Set-StepNote "Dry run: not started"; $script:CleanMgrState = "Dry run"; return }
+        # Clear any old selection under this ID, then select only our handlers.
         Get-ChildItem -LiteralPath $vc | ForEach-Object { Remove-ItemProperty -LiteralPath $_.PSPath -Name $flag -ErrorAction SilentlyContinue }
-    } elseif ($script:CleanMgrState -eq "Still running in background") {
-        Set-StepNote "Still running after $([int]$budget) min; more space will be freed when it finishes"
+        foreach ($h in $handlers) {
+            $k = Join-Path $vc $h
+            if (Test-Path -LiteralPath $k) { New-ItemProperty -LiteralPath $k -Name $flag -Value 2 -PropertyType DWord -Force | Out-Null }
+        }
+    }
+    if ($DryRun) { $script:CleanMgrState = "Dry run"; return }
+
+    try {
+        $action = New-ScheduledTaskAction -Execute $exe -Argument $args2
+        $principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" -LogonType ServiceAccount -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 3)
+        Register-ScheduledTask -TaskName $taskName -TaskPath "\" -Action $action -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+        Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+        Start-Sleep -Seconds 3
+        $script:CleanMgrState = "Started in background"
+        if ($woIncluded) { $script:WinOldInBackground = $true }
+        Set-StepNote "Keeps running after this script; run again later to see the space freed"
+    } catch {
+        $script:CleanMgrState = "Failed to start"
+        Set-StepNote ("Could not start background task: " + $_.Exception.Message)
     }
 }
 
 # Removes whatever Disk Cleanup left behind (or everything, if Disk Cleanup did not run).
-Invoke-CleanupStep "Old Windows install (Windows.old)" ($UpgradeFolders.Count -gt 0) {
+Invoke-CleanupStep "Old Windows install (Windows.old)" $true {
+    if ($UpgradeFolders.Count -eq 0) { Set-StepNote "None found"; return }
     foreach ($f in $UpgradeFolders) {
         if (-not (Test-Path -LiteralPath $f.Path)) { $f.Result = "Removed by Disk Cleanup"; continue }
         if (-not $RemoveOldWindowsInstall) { $f.Result = "Kept (disabled in settings)"; continue }
         if ($f.AgeDays -lt $WindowsOldMinDays) { $f.Result = "Kept ($($f.AgeDays) days old, rollback still possible)"; continue }
         if ($SetupBusy) { $f.Result = "Skipped (Windows upgrade is running)"; continue }
-        if ($CleanMgrState -eq "Still running in background") { $f.Result = "Skipped (Disk Cleanup is still removing it)"; continue }
-        if ($DryRun) { $f.Result = "Would remove"; $script:StepBytes += $f.Size; continue }
-        if ((Get-MinutesLeft) -lt 8) { $f.Result = "Skipped (time budget); run again"; continue }
+        if ($f.Name -eq "Windows.old" -and $script:WinOldInBackground) { $f.Result = "Being removed by Disk Cleanup (background)"; continue }
+        if ($DryRun) { $f.Result = "Would remove"; continue }
+        if ((Get-MinutesLeft) -lt 2) { $f.Result = "Not removed yet (time budget); run again"; continue }
         $f.Result = Remove-UpgradeFolder $f.Path
         if ($f.Result -eq "Removed") { $script:StepBytes += $f.Size }
     }
     Set-StepNote "$($UpgradeFolders.Count) folder(s) checked"
 }
-if (-not $Proceed) { foreach ($f in $UpgradeFolders) { $f.Result = "Present (cleanup not run, above threshold)" } }
+if (-not $Proceed) { foreach ($f in $UpgradeFolders) { $f.Result = "Present (cleanup not run)" } }
 
 # ---------------- Results ----------------
 $Disk = Get-DiskInfo
@@ -533,7 +558,11 @@ elseif ($PctAfter -ge 10) { $Status = "OK" }
 elseif ($PctAfter -ge 5) { $Status = "LOW" }
 else { $Status = "CRITICAL" }
 if ($DryRun) { $Status = "DRY RUN (current: $Status)" }
-if (-not $Proceed) {
+if ($NotElevated) {
+    $Status = "NOT RUN - NEEDS SYSTEM"
+    $CleanMgrState = "Not run"
+    Add-Finding "FAIL" "Script is not running with elevated rights ($Context). Enable 'Run with Elevated Permissions (System Account)' in ZDX. Nothing was changed."
+} elseif (-not $Proceed) {
     $Status = "NO ACTION NEEDED"
     $CleanMgrState = "Not needed"
     Add-Finding "INFO" "Free space $(Format-Size $FreeBefore) is above the $RunIfFreeAtOrBelowGB GB threshold. No cleanup was done."
@@ -543,10 +572,11 @@ if ($PendingReboot.Count -gt 0) {
     Add-Finding "INFO" "Restart pending ($($PendingReboot -join ', ')). A restart can free more space and lets update cleanup finish."
 }
 if ($Proceed -and $ServicingBusy) { Add-Finding "INFO" "Windows servicing (TiWorker) was running; update-related cleanup was limited. Run again later for more space." }
-if ($CleanMgrState -eq "Still running in background") { Add-Finding "INFO" "Disk Cleanup is still running. Re-check free space in 30-60 minutes." }
+if ($CleanMgrState -match "background") { Add-Finding "INFO" "Windows Disk Cleanup is running in the background (10-60 min). Run this script again later to see the final free space." }
+if ($script:TimeCut) { Add-Finding "INFO" "Some steps stopped early to stay inside the ZDX time limit. Run the script again to continue." }
 foreach ($f in $UpgradeFolders) {
-    if ($Proceed -and -not $DryRun -and $f.Result -notmatch '^Removed') {
-        Add-Finding "INFO" "$($f.Path) ($(Format-Size $f.Size)) was not removed: $($f.Result)."
+    if ($Proceed -and -not $DryRun -and $f.Result -notmatch '^Removed|background') {
+        Add-Finding "INFO" "$($f.Path) was not removed: $($f.Result)."
     }
 }
 
@@ -558,7 +588,7 @@ $OneDriveLines = @()
 if ($Proceed -and $PctAfter -lt 15 -and -not $DryRun) {
     Add-Finding "WARNING" "Free space is still below 15% after cleanup. Remaining space is likely user data or applications."
     if ($DeepReportWhenLow -and $Profiles.Count -gt 0) {
-        if ((Get-MinutesLeft) -lt 4) {
+        if ((Get-MinutesLeft) -lt 1.5) {
             Add-Finding "INFO" "Detailed space report skipped to stay inside the $MaxRuntimeMinutes minute time budget."
         } else {
             $RecallMask = 0x400000 -bor 0x1000   # cloud-only (not stored locally) / offline
@@ -576,7 +606,7 @@ if ($Proceed -and $PctAfter -lt 15 -and -not $DryRun) {
                 $stack = New-Object System.Collections.Stack
                 $stack.Push($root)
                 while ($stack.Count -gt 0) {
-                    if ((Get-MinutesLeft) -lt 1) { $ReportCut = $true; break }
+                    if ((Get-MinutesLeft) -lt 0.4) { $ReportCut = $true; break }
                     $d = $stack.Pop()
                     try { $entries = ([IO.DirectoryInfo]$d).GetFileSystemInfos() } catch { continue }
                     foreach ($e in $entries) {
@@ -662,15 +692,15 @@ $Lines = @(
 
 if ($UpgradeFolders.Count -eq 0) { $Lines += "None found." }
 foreach ($f in $UpgradeFolders) {
-    if ($Proceed) { $Lines += "$($f.Path) : $(Format-Size $f.Size), $($f.AgeDays) days old -> $($f.Result)" }
-    else { $Lines += "$($f.Path) : $($f.AgeDays) days old -> $($f.Result)" }
+    $Lines += "$($f.Path) : $($f.AgeDays) days old -> $($f.Result)"
 }
 
 $Lines += ""
 $Lines += "Cleanup Steps"
 $Lines += "-------------"
 
-if (-not $Proceed) { $Lines += "Not run. Free space is above the threshold." }
+if ($NotElevated) { $Lines += "Not run. Needs elevated rights (System)." }
+elseif (-not $Proceed) { $Lines += "Not run. Free space is above the threshold." }
 
 foreach ($s in $Steps) {
     if ($s.Note -eq "Disabled in settings") {
@@ -729,7 +759,9 @@ if ($WriteLocalLog) { [void](Write-LocalLog "Disk_Space_Cleanup" $Output) }
 
 # Same ZDX output/result API pattern as the working Employee Experience Health Check.
 Set-ZOutput $Output
-if (-not $Proceed) {
+if ($NotElevated) {
+    Set-ZResult -Status Success -Message "Disk Space Cleanup: NOT RUN - needs Elevated Permissions (System)."
+} elseif (-not $Proceed) {
     Set-ZResult -Status Success -Message "Disk Space Cleanup: no action needed. Free space $(Format-Size $FreeBefore) is above $RunIfFreeAtOrBelowGB GB."
 } else {
     Set-ZResult -Status Success -Message "Disk Space Cleanup completed. Freed $(Format-Size $TotalFreed). Free now $(Format-Size $FreeAfter) ($PctAfter%)."

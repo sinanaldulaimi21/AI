@@ -25,7 +25,7 @@ Teams_Cache_Reset_v2.2.ps1
 - User may need to sign in to Teams again.
 - Rollback: close Teams, delete the new MSTeams folder, rename the .bak_ folder back.
 
-Disk_Space_Cleanup_v2.0.ps1
+Disk_Space_Cleanup_v2.1.ps1
 - Runs only if C: has 20 GB free or less ($RunIfFreeAtOrBelowGB, 0 = always run).
   Above that, it changes nothing and reports "NO ACTION NEEDED".
 - Cleans: Windows temp, WER reports, old CBS logs, all users' temp/INetCache/crash dumps,
@@ -34,8 +34,12 @@ Disk_Space_Cleanup_v2.0.ps1
   (update cleanup, setup files, old drivers, Windows.old if older than 10 days).
 - Never touches Documents, Desktop, Downloads or other user files.
 - Reports free space before/after and space freed per step.
-- NEW: Time budget ($MaxRuntimeMinutes, default 40). Disk Cleanup is shortened or skipped
-  so the script always returns its output to ZDX.
+- v2.1: Finishes inside the ZDX time limit ($MaxRuntimeMinutes = 4; ZDX stops scripts at
+  ~5-6 min). Fastest/biggest wins first; every step checks the budget. Windows Disk
+  Cleanup (incl. Windows.old) runs as a one-time SYSTEM background task
+  (ZDX_DiskCleanup_Background) and keeps going after the script returns; run the
+  script again later to see the final free space. Stops if not run as System.
+  Progress is written after each step to Logs\Disk_Space_Cleanup_progress.log.
 - NEW: Uses DISM component cleanup if cleanmgr is not available on the device.
 - NEW: Old Windows installation: measures Windows.old and upgrade leftovers
   ($WINDOWS.~BT, $Windows.~WS, $GetCurrent) and shows their size. If Disk Cleanup did not
