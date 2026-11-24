@@ -1,7 +1,7 @@
-Disk Space Cleanup - Tanium Package (v1.0)
+Disk Space Cleanup - Tanium Package (v1.1)
 Created by: Sinan Aldulaimi
 
-Same cleanup as ZDX Disk Space Cleanup v2.1, adapted for Tanium:
+Same cleanup as ZDX Disk Space Cleanup v2.2, adapted for Tanium:
 - No 5-minute limit: Windows Disk Cleanup and Windows.old removal finish in the same run
   (waits up to 30 min; script budget 45 min).
 - Runs only if C: has 20 GB free or less ($RunIfFreeAtOrBelowGB).
@@ -9,9 +9,9 @@ Same cleanup as ZDX Disk Space Cleanup v2.1, adapted for Tanium:
 - Stops and changes nothing if not running as SYSTEM (Tanium runs packages as SYSTEM).
 
 1. Create the package
-   - Package name : EllisDon - Disk Space Cleanup v1.0
-   - File         : Disk_Space_Cleanup_Tanium_v1.0.ps1 (signed copy if your policy requires it)
-   - Command      : cmd.exe /d /c powershell.exe -NoProfile -ExecutionPolicy Bypass -File Disk_Space_Cleanup_Tanium_v1.0.ps1
+   - Package name : EllisDon - Disk Space Cleanup v1.1
+   - File         : Disk_Space_Cleanup_Tanium_v1.1.ps1 (signed copy if your policy requires it)
+   - Command      : cmd.exe /d /c powershell.exe -NoProfile -ExecutionPolicy Bypass -File Disk_Space_Cleanup_Tanium_v1.1.ps1
    - Timeout      : 60 minutes
    - Platform     : Windows
 
@@ -40,3 +40,7 @@ Notes
   (or 0 = always) before signing.
 - $DryRun = $true reports what it would do without changing anything.
 - Any edit after signing breaks the signature.
+
+v1.1 (11/24/2026): report fix only. In v1.0, any step that freed more than ~2 GB was
+dropped from the report and "Space Freed" showed 0 MB ([Math]::Max int overflow). The
+cleanup itself was not affected. Install Verification value: Version = "Tanium 1.1".

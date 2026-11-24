@@ -1,5 +1,5 @@
 # ZDX Disk Space Cleanup (System Drive)
-# Version 2.1 - REMEDIATION (makes changes) - ASCII
+# Version 2.2 - REMEDIATION (makes changes) - ASCII
 # Created by: Sinan Aldulaimi
 # Frees as much space as safely possible on the system drive (C:).
 # Runs only when free space is at or below $RunIfFreeAtOrBelowGB.
@@ -12,7 +12,7 @@
 # Run with Elevated Permissions (System Account).
 
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "2.1"
+$Version = "2.2"
 
 # ---------------- Settings ----------------
 $DryRun                    = $false  # $true = measure only, delete nothing
@@ -62,7 +62,7 @@ function Format-Size {
 }
 
 function Get-MinutesLeft {
-    return [Math]::Max(0, $MaxRuntimeMinutes - ((Get-Date) - $StartTime).TotalMinutes)
+    return [Math]::Max([double]0, $MaxRuntimeMinutes - ((Get-Date) - $StartTime).TotalMinutes)
 }
 
 function Get-DiskInfo {
@@ -165,7 +165,7 @@ function Invoke-CleanupStep {
     $after = (Get-DiskInfo).Free
     $script:Steps += [pscustomobject]@{
         Name    = $Name
-        Freed   = [Math]::Max(0, $after - $before)
+        Freed   = [Math]::Max([double]0, $after - $before)
         Found   = $script:StepBytes
         Files   = $script:StepFiles
         Seconds = [int]((Get-Date) - $t).TotalSeconds
@@ -543,7 +543,7 @@ if (-not $Proceed) { foreach ($f in $UpgradeFolders) { $f.Result = "Present (cle
 # ---------------- Results ----------------
 $Disk = Get-DiskInfo
 $FreeAfter = $Disk.Free
-$TotalFreed = [Math]::Max(0, $FreeAfter - $FreeBefore)
+$TotalFreed = [Math]::Max([double]0, $FreeAfter - $FreeBefore)
 $FoundTotal = ($Steps | Measure-Object Found -Sum).Sum
 $FilesTotal = ($Steps | Measure-Object Files -Sum).Sum
 if (-not $FoundTotal) { $FoundTotal = 0 }

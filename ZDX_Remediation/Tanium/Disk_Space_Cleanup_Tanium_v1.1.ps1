@@ -1,5 +1,5 @@
 # Disk Space Cleanup (System Drive) - TANIUM PACKAGE EDITION
-# Version 1.0 (based on ZDX Disk Space Cleanup v2.1) - REMEDIATION (makes changes) - ASCII
+# Version 1.1 (based on ZDX Disk Space Cleanup v2.2) - REMEDIATION (makes changes) - ASCII
 # Created by: Sinan Aldulaimi
 # Frees as much space as safely possible on the system drive (C:).
 # Runs only when free space is at or below $RunIfFreeAtOrBelowGB.
@@ -9,13 +9,13 @@
 # Runs from a Tanium package as SYSTEM. No 5-minute limit, so Windows Disk Cleanup
 # and Windows.old removal finish in the same run.
 # Package command:
-#   cmd.exe /d /c powershell.exe -NoProfile -ExecutionPolicy Bypass -File Disk_Space_Cleanup_Tanium_v1.0.ps1
+#   cmd.exe /d /c powershell.exe -NoProfile -ExecutionPolicy Bypass -File Disk_Space_Cleanup_Tanium_v1.1.ps1
 # Set the package timeout to 60 minutes (script budget is 45).
 # Results: printed to the action log, saved to C:\ProgramData\ZDX_Remediation\Logs,
 # and summarized in HKLM\SOFTWARE\EllisDon\DiskSpaceCleanup for a Tanium registry sensor.
 
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "Tanium 1.0"
+$Version = "Tanium 1.1"
 
 # ---------------- Settings ----------------
 $DryRun                    = $false  # $true = measure only, delete nothing
@@ -66,7 +66,7 @@ function Format-Size {
 }
 
 function Get-MinutesLeft {
-    return [Math]::Max(0, $MaxRuntimeMinutes - ((Get-Date) - $StartTime).TotalMinutes)
+    return [Math]::Max([double]0, $MaxRuntimeMinutes - ((Get-Date) - $StartTime).TotalMinutes)
 }
 
 function Get-DiskInfo {
@@ -169,7 +169,7 @@ function Invoke-CleanupStep {
     $after = (Get-DiskInfo).Free
     $script:Steps += [pscustomobject]@{
         Name    = $Name
-        Freed   = [Math]::Max(0, $after - $before)
+        Freed   = [Math]::Max([double]0, $after - $before)
         Found   = $script:StepBytes
         Files   = $script:StepFiles
         Seconds = [int]((Get-Date) - $t).TotalSeconds
@@ -561,7 +561,7 @@ if (-not $Proceed) { foreach ($f in $UpgradeFolders) { $f.Result = "Present (cle
 # ---------------- Results ----------------
 $Disk = Get-DiskInfo
 $FreeAfter = $Disk.Free
-$TotalFreed = [Math]::Max(0, $FreeAfter - $FreeBefore)
+$TotalFreed = [Math]::Max([double]0, $FreeAfter - $FreeBefore)
 $FoundTotal = ($Steps | Measure-Object Found -Sum).Sum
 $FilesTotal = ($Steps | Measure-Object Files -Sum).Sum
 if (-not $FoundTotal) { $FoundTotal = 0 }
